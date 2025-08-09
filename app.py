@@ -107,7 +107,11 @@ async def voice(request: Request):
   <Start>
     <Stream url="{wss_url}"/>
   </Start>
-  <Say language="ar-SA">مرحباً، تفضل تحدث. أنا أصغي إليك.</Say>
+  <Say language="ar-SA" voice="Polly.Zeina">
+    مرحبًا بكم في سمارت كول سنتر. تفضّل بالحديث، أنا أُصغي إليك.
+  </Say>
+  <!-- إبقِ المكالمة مفتوحة ليستمر البث نحو خادمك -->
+  <Pause length="60"/>
 </Response>
 """.strip()
     return Response(content=twiml, media_type="text/xml; charset=utf-8")
@@ -366,4 +370,5 @@ async def _synthesize_tts(text: str) -> Optional[str]:
 # فحص سريع
 @app.get("/health")
 async def health():
+
     return PlainTextResponse("OK")
