@@ -1,6 +1,7 @@
 # app.py
-import os, io, base64, uuid, sqlite3, datetime, json, asyncio, logging, threading, queue
+import os, base64, uuid, sqlite3, datetime, json, asyncio, logging, threading, queue
 from urllib.parse import urlparse, parse_qs
+from typing import Optional
 
 # دعم audioop على بايثون 3.13
 try:
@@ -13,14 +14,13 @@ from fastapi.responses import Response, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
 
-# لوجز واضحة
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("smart-cc")
 
 # ====== البيئة ======
 load_dotenv()
 
-# اعتماد جوجل كـ JSON عبر متغير GCP_KEY_JSON (يُكتب لملف gcp.json وقت التشغيل)
+# اكتب اعتماد Google من المتغير GCP_KEY_JSON إلى ملف gcp.json
 GCP_KEY_JSON = os.getenv("GCP_KEY_JSON")
 if GCP_KEY_JSON:
     try:
@@ -75,7 +75,7 @@ app = FastAPI()
 os.makedirs("public/tts", exist_ok=True)           # ينشئ public أيضًا إن لم يوجد
 app.mount("/public", StaticFiles(directory="public"), name="public")
 
-CALL_STATE = {}  # حالة المكالمات البسيطة بالذاكرة
+CALL_STATE = {}  # حالة المكالمات بالذاكرة
 
 def log_conv(call_sid: str, turn: int, user_text: str, intent: str,
              tool_called: str, tool_result: str, reply_text: str, reply_audio_url: str):
@@ -92,6 +92,11 @@ def log_conv(call_sid: str, turn: int, user_text: str, intent: str,
 # ================== المسارات ==================
 @app.get("/health")
 async def health():
+    return PlainTextResponse("OK")
+
+# (اختياري) لمنع 404 من Twilio Status Callback إن وُضع
+@app.post("/twilio/status")
+async def twilio_status(request: Request):
     return PlainTextResponse("OK")
 
 # بدء المكالمة: تحية + تفعيل Media Streams
@@ -121,7 +126,7 @@ async def voice(request: Request):
 async def media(ws: WebSocket):
     await ws.accept()
 
-    # حاول أخذ callSid من الـquery (احتياطي)
+    # جرّب أخذ callSid من الـquery (قد يكون فارغ حتى يصل حدث start)
     qs = ws.scope.get("query_string", b"").decode()
     qd = parse_qs(qs)
     call_sid = (qd.get("CallSid") or qd.get("callSid") or [""])[0]
@@ -143,13 +148,11 @@ async def media(ws: WebSocket):
         single_utterance=False,
     )
 
-    # Queue + مولّد: نرسل أولًا رسالة الـconfig ثم بايتات الصوت
+    # Queue + مولّد: يرسل الصوت فقط (لا نرسل config داخل المولّد لهذه النسخة من المكتبة)
     audio_q: queue.Queue[bytes] = queue.Queue(maxsize=200)
 
     def request_iter():
         from google.cloud.speech_v1p1beta1 import StreamingRecognizeRequest
-        # أول رسالة: config
-        yield StreamingRecognizeRequest(streaming_config=streaming_config)
         while True:
             chunk = audio_q.get()
             if chunk is None:
@@ -160,7 +163,8 @@ async def media(ws: WebSocket):
 
     def stt_consumer():
         try:
-            for resp in speech_client.streaming_recognize(request_iter()):
+            # الشكل المتوافق: نمرر streaming_config + المولّد
+            for resp in speech_client.streaming_recognize(streaming_config, request_iter()):
                 for result in resp.results:
                     if result.is_final:
                         transcript = result.alternatives[0].transcript.strip()
@@ -188,6 +192,7 @@ async def media(ws: WebSocket):
                 if ev_call_sid:
                     call_sid = ev_call_sid
                     log.info(f"WS start: call_sid={call_sid}")
+
             elif et == "media":
                 b64 = event.get("media", {}).get("payload")
                 if b64:
@@ -199,9 +204,11 @@ async def media(ws: WebSocket):
                     except queue.Full:
                         _ = audio_q.get_nowait()
                         audio_q.put_nowait(pcm)
+
             elif et == "stop":
                 log.info(f"WS stop [{call_sid}]")
                 break
+
     except WebSocketDisconnect:
         log.info(f"WS disconnected [{call_sid}]")
     except Exception as e:
@@ -222,7 +229,7 @@ async def _handle_user_turn(call_sid: str, user_text: str):
     prepared_text = await _arabic_diacritize_and_style(reply_text)
     mp3_url = await _synthesize_tts(prepared_text)
 
-    if twilio_client:
+    if twilio_client and call_sid:
         from twilio.base.exceptions import TwilioException
         try:
             if mp3_url:
@@ -311,7 +318,7 @@ async def _llm_plan_and_reply(user_text: str):
 
     return intent, tool_called, (json.dumps(tool_result, ensure_ascii=False) if tool_result else None), answer
 
-# أدوات وهمية (اربطها لاحقًا بقاعدة بياناتك)
+# أدوات وهمية (اربطها لاحقًا ببياناتك)
 def _mock_lookup_balance(customer_id: str):
     return {"customer_id": customer_id or "12345", "balance": 150.50}
 
@@ -338,11 +345,10 @@ async def _arabic_diacritize_and_style(text: str) -> str:
         log.exception(f"Diacritize error: {e}")
         return text
 
-async def _synthesize_tts(text: str):
+async def _synthesize_tts(text: str) -> Optional[str]:
     if not openai_client:
         return None
     try:
-        # بث الملف مباشرة إلى القرص (Heroku-friendly)
         file_id = f"{uuid.uuid4()}.mp3"
         path = os.path.join("public", "tts", file_id)
 
