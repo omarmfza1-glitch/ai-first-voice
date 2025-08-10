@@ -1,10 +1,10 @@
 # app.py
 import os, io, base64, uuid, sqlite3, datetime, json, asyncio, logging, threading, queue
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
-# دعم audioop على بايثون 3.13 عبر مكتبة بديلة
+# دعم audioop على بايثون 3.13
 try:
-    import audioop  # Python <= 3.12
+    import audioop          # Python <= 3.12
 except ModuleNotFoundError:
     import audioop_lts as audioop  # بديل متوافق
 
@@ -17,10 +17,10 @@ from dotenv import load_dotenv
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("smart-cc")
 
-# ==== تهيئة البيئة ====
+# ====== البيئة ======
 load_dotenv()
 
-# اعتماد جوجل كـ JSON عبر متغير بيئة GCP_KEY_JSON
+# اعتماد جوجل كـ JSON عبر متغير GCP_KEY_JSON (يُكتب لملف gcp.json وقت التشغيل)
 GCP_KEY_JSON = os.getenv("GCP_KEY_JSON")
 if GCP_KEY_JSON:
     try:
@@ -35,9 +35,9 @@ PORT = int(os.getenv("PORT", 5000))
 BASE_URL = os.getenv("BASE_URL", f"http://127.0.0.1:{PORT}").rstrip("/")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_AUTH_TOKEN  = os.getenv("TWILIO_AUTH_TOKEN")
 
-# ==== قواعد البيانات (SQLite) ====
+# ====== قواعد البيانات (SQLite) ======
 DB_PATH = os.path.join(os.path.dirname(__file__), "db.sqlite3")
 os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
 
@@ -62,7 +62,7 @@ def init_db():
     conn.close()
 init_db()
 
-# ==== عملاء الخدمات الخارجية ====
+# ====== عملاء الخدمات ======
 from twilio.rest import Client as TwilioClient
 from openai import OpenAI
 from google.cloud import speech_v1p1beta1 as speech
@@ -70,13 +70,12 @@ from google.cloud import speech_v1p1beta1 as speech
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) if (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN) else None
 
-# ==== تطبيق FastAPI + ملفات ثابتة ====
+# ====== تطبيق FastAPI + الملفات الثابتة ======
 app = FastAPI()
-os.makedirs("public/tts", exist_ok=True)           # ينشئ public أيضًا
+os.makedirs("public/tts", exist_ok=True)           # ينشئ public أيضًا إن لم يوجد
 app.mount("/public", StaticFiles(directory="public"), name="public")
 
-# ذاكرة حالة بسيطة
-CALL_STATE = {}  # call_sid -> {"turn": int}
+CALL_STATE = {}  # حالة المكالمات البسيطة بالذاكرة
 
 def log_conv(call_sid: str, turn: int, user_text: str, intent: str,
              tool_called: str, tool_result: str, reply_text: str, reply_audio_url: str):
@@ -90,12 +89,12 @@ def log_conv(call_sid: str, turn: int, user_text: str, intent: str,
     conn.commit()
     conn.close()
 
-# ========== مسارات ==========
+# ================== المسارات ==================
 @app.get("/health")
 async def health():
     return PlainTextResponse("OK")
 
-# بدء المكالمة: تحية + تفعيل Media Stream
+# بدء المكالمة: تحية + تفعيل Media Streams
 @app.post("/voice")
 async def voice(request: Request):
     form = await request.form()
@@ -117,37 +116,40 @@ async def voice(request: Request):
     log.info(f"/voice: started call_sid={call_sid} -> stream {wss_url}")
     return Response(content=twiml, media_type="text/xml; charset=utf-8")
 
-# WebSocket يستقبل الصوت من Twilio (μ-law 8kHz) → Google STT
+# WebSocket: يستقبل صوت μ-law 8kHz من Twilio → Google STT (Streaming)
 @app.websocket("/media")
 async def media(ws: WebSocket):
     await ws.accept()
-    query = ws.scope.get("query_string", b"").decode()
-    call_sid = ""
-    if "callSid=" in query:
-        call_sid = query.split("callSid=")[1].split("&")[0]
+
+    # حاول أخذ callSid من الـquery (احتياطي)
+    qs = ws.scope.get("query_string", b"").decode()
+    qd = parse_qs(qs)
+    call_sid = (qd.get("CallSid") or qd.get("callSid") or [""])[0]
     log.info(f"WS connected: call_sid={call_sid}")
 
-    # إعداد Google STT
+    # إعداد Google STT (بدون alternative_language_codes لأن model=phone_call لا يدعمها)
     speech_client = speech.SpeechClient()
+    recognition_config = speech.RecognitionConfig(
+        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+        sample_rate_hertz=8000,
+        language_code="ar-SA",
+        use_enhanced=True,
+        model="phone_call",
+        enable_automatic_punctuation=True,
+    )
     streaming_config = speech.StreamingRecognitionConfig(
-        config=speech.RecognitionConfig(
-            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-            sample_rate_hertz=8000,
-            language_code="ar-SA",
-            alternative_language_codes=["en-US"],
-            use_enhanced=True,
-            model="phone_call",
-            enable_automatic_punctuation=True,
-        ),
+        config=recognition_config,
         interim_results=True,
         single_utterance=False,
     )
 
-    # Queue + مولّد عادي (كما يتوقع عميل Google)
+    # Queue + مولّد: نرسل أولًا رسالة الـconfig ثم بايتات الصوت
     audio_q: queue.Queue[bytes] = queue.Queue(maxsize=200)
 
     def request_iter():
         from google.cloud.speech_v1p1beta1 import StreamingRecognizeRequest
+        # أول رسالة: config
+        yield StreamingRecognizeRequest(streaming_config=streaming_config)
         while True:
             chunk = audio_q.get()
             if chunk is None:
@@ -158,7 +160,7 @@ async def media(ws: WebSocket):
 
     def stt_consumer():
         try:
-            for resp in speech_client.streaming_recognize(streaming_config, request_iter()):
+            for resp in speech_client.streaming_recognize(request_iter()):
                 for result in resp.results:
                     if result.is_final:
                         transcript = result.alternatives[0].transcript.strip()
@@ -178,13 +180,20 @@ async def media(ws: WebSocket):
             msg = await ws.receive_text()
             event = json.loads(msg)
             et = event.get("event")
+
             if et == "start":
-                log.info(f"WS start [{call_sid}]")
+                # هنا نحصل على callSid الأكيد من حدث start
+                start = event.get("start", {}) or event.get("Start", {})
+                ev_call_sid = start.get("callSid") or start.get("CallSid")
+                if ev_call_sid:
+                    call_sid = ev_call_sid
+                    log.info(f"WS start: call_sid={call_sid}")
             elif et == "media":
                 b64 = event.get("media", {}).get("payload")
                 if b64:
+                    # μ-law → PCM16
                     ulaw = base64.b64decode(b64)
-                    pcm = audioop.ulaw2lin(ulaw, 2)  # μ-law → PCM16
+                    pcm = audioop.ulaw2lin(ulaw, 2)
                     try:
                         audio_q.put_nowait(pcm)
                     except queue.Full:
@@ -208,6 +217,7 @@ async def media(ws: WebSocket):
 # ====== منطق الحوار ======
 async def _handle_user_turn(call_sid: str, user_text: str):
     log.info(f"HANDLE TURN [{call_sid}]: '{user_text}'")
+
     intent, tool_called, tool_result, reply_text = await _llm_plan_and_reply(user_text)
     prepared_text = await _arabic_diacritize_and_style(reply_text)
     mp3_url = await _synthesize_tts(prepared_text)
@@ -332,7 +342,7 @@ async def _synthesize_tts(text: str):
     if not openai_client:
         return None
     try:
-        # استخدام البث للملف مباشرة (أكثر ثباتًا على Heroku)
+        # بث الملف مباشرة إلى القرص (Heroku-friendly)
         file_id = f"{uuid.uuid4()}.mp3"
         path = os.path.join("public", "tts", file_id)
 
