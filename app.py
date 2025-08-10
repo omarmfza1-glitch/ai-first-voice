@@ -13,7 +13,13 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
+
 load_dotenv()
+
+
+app = FastAPI()
+os.makedirs("public/tts", exist_ok=True)  # ينشئ public أيضًا إن لم يوجد
+app.mount("/public", StaticFiles(directory="public"), name="public")
 
 # --- بيئة ---
 # ✨ دعم تمرير اعتماد جوجل كـ JSON عبر متغير بيئة (GCP_KEY_JSON) وكتابته لملف gcp.json وقت التشغيل
@@ -65,8 +71,7 @@ if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
     twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 # --- FastAPI ---
-app = FastAPI()
-app.mount("/public", StaticFiles(directory="public"), name="public")
+
 
 # تأكد من وجود مجلد tts
 os.makedirs("public/tts", exist_ok=True)
@@ -379,3 +384,4 @@ async def _synthesize_tts(text: str) -> Optional[str]:
 @app.get("/health")
 async def health():
     return PlainTextResponse("OK")
+
