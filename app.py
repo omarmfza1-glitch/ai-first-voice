@@ -1,3 +1,4 @@
+```python
 # app.py
 import os, io, base64, uuid, sqlite3, datetime, json
 # دعم audioop على بايثون 3.13 عبر مكتبة بديلة
