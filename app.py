@@ -64,6 +64,7 @@ init_db()
 
 # ====== عملاء الخدمات ======
 from twilio.rest import Client as TwilioClient
+from twilio.base.exceptions import TwilioException
 from openai import OpenAI
 from google.cloud import speech_v1p1beta1 as speech
 
@@ -115,7 +116,7 @@ async def voice(request: Request):
 <Response>
   <Start><Stream url="{wss_url}"/></Start>
   <Say language="ar-SA" voice="Polly.Zeina">مرحبًا بكم في سمارت كول سنتر. تفضّل بالحديث، أنا أُصغي إليك.</Say>
-  <Pause length="60"/>
+  <Pause length="30"/>
 </Response>
 """.strip()
     log.info(f"/voice: started call_sid={call_sid} -> stream {wss_url}")
@@ -132,22 +133,23 @@ async def media(ws: WebSocket):
     call_sid = (qd.get("CallSid") or qd.get("callSid") or [""])[0]
     log.info(f"WS connected: call_sid={call_sid}")
 
-    # إعداد Google STT (بدون alternative_language_codes لأن model=phone_call لا يدعمها)
+    # إعداد Google STT (العربية لا تدعم model=phone_call)
     speech_client = speech.SpeechClient()
     recognition_config = speech.RecognitionConfig(
         encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
         sample_rate_hertz=8000,
         language_code="ar-SA",
-        model="default",
+        model="default",                      # ← مهم
         enable_automatic_punctuation=True,
+        # use_enhanced غير مدعومة هنا
     )
     streaming_config = speech.StreamingRecognitionConfig(
         config=recognition_config,
         interim_results=True,
-        single_utterance=False,
+        single_utterance=True,                # ← يُنهي الجملة سريعًا عند الوقفة
     )
 
-    # Queue + مولّد: يرسل الصوت فقط (لا نرسل config داخل المولّد لهذه النسخة من المكتبة)
+    # Queue + مولّد: يرسل الصوت فقط (نسخة المكتبة هذه تتوقع config كوسيط منفصل)
     audio_q: queue.Queue[bytes] = queue.Queue(maxsize=200)
 
     def request_iter():
@@ -162,7 +164,7 @@ async def media(ws: WebSocket):
 
     def stt_consumer():
         try:
-            # الشكل المتوافق: نمرر streaming_config + المولّد
+            # نمرر streaming_config + المولّد (requests)
             for resp in speech_client.streaming_recognize(streaming_config, request_iter()):
                 for result in resp.results:
                     if result.is_final:
@@ -185,7 +187,7 @@ async def media(ws: WebSocket):
             et = event.get("event")
 
             if et == "start":
-                # هنا نحصل على callSid الأكيد من حدث start
+                # هنا نحصل على callSid المؤكد من حدث start
                 start = event.get("start", {}) or event.get("Start", {})
                 ev_call_sid = start.get("callSid") or start.get("CallSid")
                 if ev_call_sid:
@@ -229,7 +231,6 @@ async def _handle_user_turn(call_sid: str, user_text: str):
     mp3_url = await _synthesize_tts(prepared_text)
 
     if twilio_client and call_sid:
-        from twilio.base.exceptions import TwilioException
         try:
             if mp3_url:
                 twiml = f"""
@@ -324,12 +325,13 @@ def _mock_lookup_balance(customer_id: str):
 def _mock_open_ticket(summary: str):
     return f"T-{str(uuid.uuid4())[:8]}"
 
+# تشكيل + أسلوب الإلقاء
 async def _arabic_diacritize_and_style(text: str) -> str:
     if not openai_client:
         return text
     prompt = (
-        "أضف التشكيل العربي للنص التالي بدقة وتهذيب، مع فواصل طبيعية (مثلاً: [pause=300ms]) "
-        "ودون إطالة مبالغ فيها. أعد النص مشكولًا قدر الإمكان مع علامات ترقيم سليمة.\n\n"
+        "أضف التشكيل العربي للنص التالي بدقة وتهذيب، مع فواصل طبيعية (مثل: [pause=300ms]) "
+        "ودون إطالة مبالغ فيها. أعد النص مشكولًا مع علامات ترقيم سليمة.\n\n"
         f"{text}"
     )
     try:
@@ -344,6 +346,7 @@ async def _arabic_diacritize_and_style(text: str) -> str:
         log.exception(f"Diacritize error: {e}")
         return text
 
+# توليد TTS إلى ملف mp3 (بدون معامل format لتوافق المكتبة)
 async def _synthesize_tts(text: str) -> Optional[str]:
     if not openai_client:
         return None
@@ -351,11 +354,11 @@ async def _synthesize_tts(text: str) -> Optional[str]:
         file_id = f"{uuid.uuid4()}.mp3"
         path = os.path.join("public", "tts", file_id)
 
+        # التوقيع المتوافق حاليًا: voice + input فقط
         with openai_client.audio.speech.with_streaming_response.create(
             model="gpt-4o-mini-tts",
             voice="alloy",
             input=text,
-            format="mp3",
         ) as resp:
             resp.stream_to_file(path)
 
@@ -363,4 +366,3 @@ async def _synthesize_tts(text: str) -> Optional[str]:
     except Exception as e:
         log.exception(f"TTS error: {e}")
         return None
-
