@@ -138,8 +138,7 @@ async def media(ws: WebSocket):
         encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
         sample_rate_hertz=8000,
         language_code="ar-SA",
-        use_enhanced=True,
-        model="phone_call",
+        model="default",
         enable_automatic_punctuation=True,
     )
     streaming_config = speech.StreamingRecognitionConfig(
@@ -364,3 +363,4 @@ async def _synthesize_tts(text: str) -> Optional[str]:
     except Exception as e:
         log.exception(f"TTS error: {e}")
         return None
+
