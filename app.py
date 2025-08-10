@@ -1,16 +1,17 @@
 # app.py
 import os, io, base64, uuid, sqlite3, datetime, json
+# دعم audioop على بايثون 3.13 عبر مكتبة بديلة
+try:
+    import audioop  # Python <= 3.12
+except ModuleNotFoundError:
+    import audioop_lts as audioop  # بديل متوافق
 from typing import Optional, List
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response, PlainTextResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from dotenv import load_dotenv
-# بدل: import audioop
-try:
-    import audioop  # موجود في بايثون <= 3.12
-except ModuleNotFoundError:
-    import audioop_lts as audioop  # بديل متوافق مع 3.13
+
 load_dotenv()
 
 # --- بيئة ---
@@ -107,11 +108,8 @@ async def voice(request: Request):
   <Start>
     <Stream url="{wss_url}"/>
   </Start>
-  <Say language="ar-SA" voice="Polly.Zeina">
-    مرحبًا بكم في سمارت كول سنتر. تفضّل بالحديث، أنا أُصغي إليك.
-  </Say>
-  <!-- إبقِ المكالمة مفتوحة ليستمر البث نحو خادمك -->
-  <Pause length="60"/>
+  <Say language="ar-SA" voice="Polly.Zeina">مرحبًا بكم في سمارت كول سنتر. تفضّل بالحديث، أنا أُصغي إليك.</Say>
+  <Pause length="600"/>
 </Response>
 """.strip()
     return Response(content=twiml, media_type="text/xml; charset=utf-8")
@@ -225,14 +223,23 @@ async def _handle_user_turn(call_sid: str, user_text: str):
     mp3_url = await _synthesize_tts(prepared_text)
 
     # 4) تحديث مكالمة Twilio لِتشغيل الصوت ثم إعادة الاستماع
-    if twilio_client and mp3_url:
+    if twilio_client:
         from twilio.base.exceptions import TwilioException
         try:
-            # بعد التشغيل، نعيد الاتصال إلى /voice لبدء دور استماع جديد
-            twiml = f"""
+            if mp3_url:
+                twiml = f"""
 <Response>
   <Play>{mp3_url}</Play>
   <Redirect method="POST">/voice</Redirect>
+</Response>
+""".strip()
+            else:
+                # فallback مباشر: انطق النص عبر Twilio Say لو فشل توليد ملف الصوت
+                safe_text = prepared_text or reply_text or "حسنًا، هل يمكنك التوضيح أكثر؟"
+                twiml = f"""
+<Response>
+  <Say language=\"ar-SA\" voice=\"Polly.Zeina\">{safe_text}</Say>
+  <Redirect method=\"POST\">/voice</Redirect>
 </Response>
 """.strip()
             twilio_client.calls(call_sid).update(twiml=twiml)
@@ -370,5 +377,4 @@ async def _synthesize_tts(text: str) -> Optional[str]:
 # فحص سريع
 @app.get("/health")
 async def health():
-
     return PlainTextResponse("OK")
