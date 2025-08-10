@@ -1,5 +1,3 @@
-```python
-# app.py
 import os, io, base64, uuid, sqlite3, datetime, json
 # دعم audioop على بايثون 3.13 عبر مكتبة بديلة
 try:
@@ -384,4 +382,5 @@ async def _synthesize_tts(text: str) -> Optional[str]:
 @app.get("/health")
 async def health():
     return PlainTextResponse("OK")
+
 
