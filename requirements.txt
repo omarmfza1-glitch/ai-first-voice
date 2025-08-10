@@ -10,4 +10,4 @@ pydub>=0.25.1
 soundfile>=0.12.1
 numpy>=1.26.4
 python-dotenv>=1.0.1
-audioop-lts>=0.2.1
+audioop-lts>=0.2.2
