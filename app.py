@@ -1,5 +1,5 @@
 # app.py
-import os, base64, uuid, sqlite3, datetime, json, asyncio, logging, threading, queue
+import os, base64, uuid, sqlite3, datetime, json, asyncio, logging, threading, queue, time
 from urllib.parse import urlparse, parse_qs
 from typing import Optional
 
@@ -20,7 +20,7 @@ log = logging.getLogger("smart-cc")
 # ====== البيئة ======
 load_dotenv()
 
-# اكتب اعتماد Google من المتغير GCP_KEY_JSON إلى ملف gcp.json
+# اكتب اعتماد Google من المتغير GCP_KEY_JSON إلى gcp.json (أو استخدم GOOGLE_APPLICATION_CREDENTIALS الجاهز)
 GCP_KEY_JSON = os.getenv("GCP_KEY_JSON")
 if GCP_KEY_JSON:
     try:
@@ -73,10 +73,11 @@ twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) if (TWILIO_A
 
 # ====== تطبيق FastAPI + الملفات الثابتة ======
 app = FastAPI()
-os.makedirs("public/tts", exist_ok=True)           # ينشئ public أيضًا إن لم يوجد
+os.makedirs("public/tts", exist_ok=True)
 app.mount("/public", StaticFiles(directory="public"), name="public")
 
-CALL_STATE = {}  # حالة المكالمات بالذاكرة
+# حالة المكالمات
+CALL_STATE = {}  # {call_sid: {"turn": int, "awaiting_reply": bool, "last_emit_ts": float}}
 
 def log_conv(call_sid: str, turn: int, user_text: str, intent: str,
              tool_called: str, tool_result: str, reply_text: str, reply_audio_url: str):
@@ -95,9 +96,9 @@ def log_conv(call_sid: str, turn: int, user_text: str, intent: str,
 async def health():
     return PlainTextResponse("OK")
 
-# (اختياري) لمنع 404 من Twilio Status Callback إن وُضع
 @app.post("/twilio/status")
 async def twilio_status(request: Request):
+    # فقط لتفادي 404 في سجلات Twilio
     return PlainTextResponse("OK")
 
 # بدء المكالمة: تحية + تفعيل Media Streams
@@ -105,7 +106,8 @@ async def twilio_status(request: Request):
 async def voice(request: Request):
     form = await request.form()
     call_sid = form.get("CallSid", "")
-    CALL_STATE[call_sid] = {"turn": 0}
+    # عند كل إعادة استدعاء /voice نعيد فتح الاستماع، ونسمح بردّ جديد
+    CALL_STATE[call_sid] = {"turn": CALL_STATE.get(call_sid, {}).get("turn", 0), "awaiting_reply": False, "last_emit_ts": 0.0}
 
     parsed = urlparse(BASE_URL)
     ws_scheme = "wss" if parsed.scheme == "https" else "ws"
@@ -127,13 +129,12 @@ async def voice(request: Request):
 async def media(ws: WebSocket):
     await ws.accept()
 
-    # جرّب أخذ callSid من الـquery (قد يكون فارغ حتى يصل حدث start)
     qs = ws.scope.get("query_string", b"").decode()
     qd = parse_qs(qs)
     call_sid = (qd.get("CallSid") or qd.get("callSid") or [""])[0]
     log.info(f"WS connected: call_sid={call_sid}")
 
-    # إعداد Google STT — لا نستخدم phone_call للعربية، ولا alternative_language_codes
+    # إعداد Google STT (العربية: model=default)
     speech_client = speech.SpeechClient()
     recognition_config = speech.RecognitionConfig(
         encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
@@ -145,11 +146,11 @@ async def media(ws: WebSocket):
     streaming_config = speech.StreamingRecognitionConfig(
         config=recognition_config,
         interim_results=True,
-        single_utterance=False,     # ← ✅ رجّعناها False لأن True غير مدعوم
+        single_utterance=False,  # لا يُدعم كـ True للغة الحالية
     )
 
-    # Queue + مولّد: يرسل الصوت فقط (نسخة المكتبة هذه تتوقع config كوسيط منفصل)
-    audio_q: queue.Queue[bytes] = queue.Queue(maxsize=200)
+    # Queue + مولّد يرسل الصوت فقط
+    audio_q: queue.Queue[bytes] = queue.Queue(maxsize=400)
 
     def request_iter():
         from google.cloud.speech_v1p1beta1 import StreamingRecognizeRequest
@@ -162,18 +163,48 @@ async def media(ws: WebSocket):
     loop = asyncio.get_event_loop()
 
     def stt_consumer():
+        """نستهلك ردود STT ونطلق الرد مبكرًا على النتائج المستقرة."""
         try:
-            # نمرر streaming_config + المولّد (requests)
+            last_sent_text = ""
+            # وقت بين إطلاقين متتاليين حتى لا نكرر الردود
+            min_emit_gap = 1.5  # ثوانٍ
             for resp in speech_client.streaming_recognize(streaming_config, request_iter()):
                 for result in resp.results:
-                    # حتى مع single_utterance=False، جوجل يُرسل نتائج نهائية دورياً
+                    # المخرجات المؤقتة تأتي بلا confidence ولكن معها stability (غالبًا)
+                    alt = result.alternatives[0]
+                    transcript = (alt.transcript or "").strip()
+                    if not transcript:
+                        continue
+
+                    # لا نرد إذا لدينا رد معلّق قيد الإرسال/التشغيل
+                    state = CALL_STATE.get(call_sid, {})
+                    if state.get("awaiting_reply"):
+                        continue
+
+                    now = time.time()
+                    # شرط الإطلاق:
+                    emit = False
                     if result.is_final:
-                        transcript = result.alternatives[0].transcript.strip()
-                        if transcript:
-                            log.info(f"STT FINAL [{call_sid}]: {transcript}")
-                            asyncio.run_coroutine_threadsafe(
-                                _handle_user_turn(call_sid, transcript), loop
-                            )
+                        emit = True
+                    else:
+                        stab = getattr(result, "stability", 0.0) or 0.0
+                        # إذا النص مستقر أو طويل بما يكفي نعتبره جملة مفيدة
+                        if stab >= 0.85 or len(transcript) >= 14:
+                            # لا نطلق نفس النص المتكرر
+                            if transcript != last_sent_text and (now - state.get("last_emit_ts", 0.0) > min_emit_gap):
+                                emit = True
+
+                    if emit:
+                        last_sent_text = transcript
+                        # علّم أننا بصدد إرسال ردّ (حتى لا نكرر)
+                        state["awaiting_reply"] = True
+                        state["last_emit_ts"] = now
+                        CALL_STATE[call_sid] = state
+                        log.info(f"STT FINAL* [{call_sid}]: {transcript}")
+                        asyncio.run_coroutine_threadsafe(
+                            _handle_user_turn(call_sid, transcript),
+                            loop
+                        )
         except Exception as e:
             log.exception(f"STT thread error: {e}")
 
@@ -187,7 +218,6 @@ async def media(ws: WebSocket):
             et = event.get("event")
 
             if et == "start":
-                # هنا نحصل على callSid المؤكد من حدث start
                 start = event.get("start", {}) or event.get("Start", {})
                 ev_call_sid = start.get("callSid") or start.get("CallSid")
                 if ev_call_sid:
@@ -197,9 +227,8 @@ async def media(ws: WebSocket):
             elif et == "media":
                 b64 = event.get("media", {}).get("payload")
                 if b64:
-                    # μ-law → PCM16
                     ulaw = base64.b64decode(b64)
-                    pcm = audioop.ulaw2lin(ulaw, 2)
+                    pcm = audioop.ulaw2lin(ulaw, 2)  # μ-law → PCM16
                     try:
                         audio_q.put_nowait(pcm)
                     except queue.Full:
@@ -230,6 +259,7 @@ async def _handle_user_turn(call_sid: str, user_text: str):
     prepared_text = await _arabic_diacritize_and_style(reply_text)
     mp3_url = await _synthesize_tts(prepared_text)
 
+    # أرسل الرد بينما المكالمة لا تزال In-Progress
     if twilio_client and call_sid:
         try:
             if mp3_url:
@@ -252,8 +282,12 @@ async def _handle_user_turn(call_sid: str, user_text: str):
         except TwilioException as e:
             log.exception(f"Twilio update error [{call_sid}]: {e}")
 
+    # حدّث الحالة وسجّل
     state = CALL_STATE.get(call_sid, {"turn": 0})
     state["turn"] = state.get("turn", 0) + 1
+    # ما زلنا ننتظر Redirect يفتح ستريم جديد، بعدها سنسمح برد جديد
+    state["awaiting_reply"] = True
+    state["last_emit_ts"] = time.time()
     CALL_STATE[call_sid] = state
     log_conv(call_sid, state["turn"], user_text, intent, tool_called, tool_result, reply_text, mp3_url or "")
 
@@ -318,7 +352,7 @@ async def _llm_plan_and_reply(user_text: str):
 
     return intent, tool_called, (json.dumps(tool_result, ensure_ascii=False) if tool_result else None), answer
 
-# أدوات وهمية (اربطها لاحقًا ببياناتك)
+# أدوات وهمية
 def _mock_lookup_balance(customer_id: str):
     return {"customer_id": customer_id or "12345", "balance": 150.50}
 
@@ -330,7 +364,7 @@ async def _arabic_diacritize_and_style(text: str) -> str:
     if not openai_client:
         return text
     prompt = (
-        "أضف التشكيل العربي للنص التالي بدقة وتهذيب، مع فواصل طبيعية (مثل: [pause=300ms]) "
+        "أضف التشكيل العربي للنص التالي بدقّة وتهذيب، مع فواصل طبيعية (مثل: [pause=300ms]) "
         "ودون إطالة مبالغ فيها. أعد النص مشكولًا مع علامات ترقيم سليمة.\n\n"
         f"{text}"
     )
@@ -346,21 +380,38 @@ async def _arabic_diacritize_and_style(text: str) -> str:
         log.exception(f"Diacritize error: {e}")
         return text
 
-# توليد TTS إلى ملف mp3 (بدون معامل format لتوافق المكتبة)
+# توليد TTS إلى ملف mp3 (من دون استخدام معامل format لتوافق المكتبة)
 async def _synthesize_tts(text: str) -> Optional[str]:
     if not openai_client:
         return None
     try:
-        file_id = f"{uuid.uuid4()}.mp3"
-        path = os.path.join("public", "tts", file_id)
-
-        # التوقيع المتوافق: voice + input فقط
-        with openai_client.audio.speech.with_streaming_response.create(
+        # واجهة TTS قد تعيد كائن بايتات مباشرة
+        resp = openai_client.audio.speech.create(
             model="gpt-4o-mini-tts",
             voice="alloy",
             input=text,
-        ) as resp:
-            resp.stream_to_file(path)
+        )
+        # حاول استخراج البايتات
+        audio_bytes = None
+        if hasattr(resp, "read"):
+            audio_bytes = resp.read()
+        elif hasattr(resp, "content"):
+            audio_bytes = resp.content
+        else:
+            # بعض الإصدارات تُرجع generator
+            try:
+                audio_bytes = b"".join(resp.iter_bytes())
+            except Exception:
+                pass
+
+        if not audio_bytes:
+            log.error("TTS: empty audio bytes")
+            return None
+
+        file_id = f"{uuid.uuid4()}.mp3"
+        path = os.path.join("public", "tts", file_id)
+        with open(path, "wb") as f:
+            f.write(audio_bytes)
 
         return f"{BASE_URL}/public/tts/{file_id}"
     except Exception as e:
