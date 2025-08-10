@@ -17,10 +17,10 @@ from dotenv import load_dotenv
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("smart-cc")
 
-# ====== البيئة ======
+# ================== البيئة ==================
 load_dotenv()
 
-# اكتب اعتماد Google من المتغير GCP_KEY_JSON إلى gcp.json (أو استخدم GOOGLE_APPLICATION_CREDENTIALS الجاهز)
+# خيار 1: تمرير اعتماد Google كـ JSON في متغير GCP_KEY_JSON (مريح لهيروكو)
 GCP_KEY_JSON = os.getenv("GCP_KEY_JSON")
 if GCP_KEY_JSON:
     try:
@@ -37,7 +37,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN  = os.getenv("TWILIO_AUTH_TOKEN")
 
-# ====== قواعد البيانات (SQLite) ======
+# ================== قاعدة البيانات ==================
 DB_PATH = os.path.join(os.path.dirname(__file__), "db.sqlite3")
 os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
 
@@ -62,7 +62,7 @@ def init_db():
     conn.close()
 init_db()
 
-# ====== عملاء الخدمات ======
+# ================== عملاء الخدمات ==================
 from twilio.rest import Client as TwilioClient
 from twilio.base.exceptions import TwilioException
 from openai import OpenAI
@@ -71,13 +71,14 @@ from google.cloud import speech_v1p1beta1 as speech
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) if (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN) else None
 
-# ====== تطبيق FastAPI + الملفات الثابتة ======
+# ================== تطبيق FastAPI ==================
 app = FastAPI()
 os.makedirs("public/tts", exist_ok=True)
 app.mount("/public", StaticFiles(directory="public"), name="public")
 
-# حالة المكالمات
-CALL_STATE = {}  # {call_sid: {"turn": int, "awaiting_reply": bool, "last_emit_ts": float}}
+# حالة المكالمات بالذاكرة (MVP)
+# state = { call_sid: { "turn": int, "awaiting_reply": bool, "last_emit_ts": float } }
+CALL_STATE = {}
 
 def log_conv(call_sid: str, turn: int, user_text: str, intent: str,
              tool_called: str, tool_result: str, reply_text: str, reply_audio_url: str):
@@ -91,40 +92,60 @@ def log_conv(call_sid: str, turn: int, user_text: str, intent: str,
     conn.commit()
     conn.close()
 
-# ================== المسارات ==================
+# ================== مسارات مساعدة ==================
 @app.get("/health")
 async def health():
     return PlainTextResponse("OK")
 
 @app.post("/twilio/status")
 async def twilio_status(request: Request):
-    # فقط لتفادي 404 في سجلات Twilio
+    # لتجنّب 404 في سجلات Twilio
     return PlainTextResponse("OK")
 
-# بدء المكالمة: تحية + تفعيل Media Streams
+# ================== بدء المكالمة: /voice ==================
 @app.post("/voice")
 async def voice(request: Request):
     form = await request.form()
     call_sid = form.get("CallSid", "")
-    # عند كل إعادة استدعاء /voice نعيد فتح الاستماع، ونسمح بردّ جديد
-    CALL_STATE[call_sid] = {"turn": CALL_STATE.get(call_sid, {}).get("turn", 0), "awaiting_reply": False, "last_emit_ts": 0.0}
 
+    # حافظ على الحالة ولا تعيد تهيئتها إذا موجودة — لتجنّب تكرار التحية
+    state = CALL_STATE.get(call_sid)
+    if state is None:
+        CALL_STATE[call_sid] = {"turn": 0, "awaiting_reply": False, "last_emit_ts": 0.0}
+        is_first_turn = True
+    else:
+        # وصلنا هنا عبر <Redirect> بعد ردّ سابق — اسمح بدور جديد (أعد الاستماع)
+        state["awaiting_reply"] = False
+        is_first_turn = (state.get("turn", 0) == 0)
+
+    # ابنِ عنوان WebSocket من BASE_URL أو من المضيف الحالي
     parsed = urlparse(BASE_URL)
     ws_scheme = "wss" if parsed.scheme == "https" else "ws"
     ws_host = parsed.netloc or request.url.hostname
     wss_url = f"{ws_scheme}://{ws_host}/media?callSid={call_sid}"
 
-    twiml = f"""
+    if is_first_turn:
+        # تحية أول مرة فقط
+        twiml = f"""
 <Response>
   <Start><Stream url="{wss_url}"/></Start>
   <Say language="ar-SA" voice="Polly.Zeina">مرحبًا بكم في سمارت كول سنتر. تفضّل بالحديث، أنا أُصغي إليك.</Say>
   <Pause length="60"/>
 </Response>
 """.strip()
-    log.info(f"/voice: started call_sid={call_sid} -> stream {wss_url}")
+    else:
+        # الأدوار اللاحقة: افتح الاستماع فقط بدون تحية
+        twiml = f"""
+<Response>
+  <Start><Stream url="{wss_url}"/></Start>
+  <Pause length="60"/>
+</Response>
+""".strip()
+
+    log.info(f"/voice: started call_sid={call_sid} -> stream {wss_url} (first_turn={is_first_turn})")
     return Response(content=twiml, media_type="text/xml; charset=utf-8")
 
-# WebSocket: يستقبل صوت μ-law 8kHz من Twilio → Google STT (Streaming)
+# ================== WebSocket للاستماع ==================
 @app.websocket("/media")
 async def media(ws: WebSocket):
     await ws.accept()
@@ -134,22 +155,22 @@ async def media(ws: WebSocket):
     call_sid = (qd.get("CallSid") or qd.get("callSid") or [""])[0]
     log.info(f"WS connected: call_sid={call_sid}")
 
-    # إعداد Google STT (العربية: model=default)
+    # إعداد Google STT — أكثر إعداد آمن للعربية عبر الهاتف
     speech_client = speech.SpeechClient()
     recognition_config = speech.RecognitionConfig(
         encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
         sample_rate_hertz=8000,
         language_code="ar-SA",
-        model="default",
+        model="default",                     # phone_call لا يدعم ar-SA في حسابات كثيرة
         enable_automatic_punctuation=True,
     )
     streaming_config = speech.StreamingRecognitionConfig(
         config=recognition_config,
         interim_results=True,
-        single_utterance=False,  # لا يُدعم كـ True للغة الحالية
+        single_utterance=False,              # True غير مدعوم/يسبب إغلاق مبكر
     )
 
-    # Queue + مولّد يرسل الصوت فقط
+    # طابور لتجميع الصوت وإرساله إلى Google
     audio_q: queue.Queue[bytes] = queue.Queue(maxsize=400)
 
     def request_iter():
@@ -162,49 +183,40 @@ async def media(ws: WebSocket):
 
     loop = asyncio.get_event_loop()
 
+    # مستهلك ردود STT في خيط منفصل، ويُطلق الردود مبكرًا على نتائج مستقرة
     def stt_consumer():
-        """نستهلك ردود STT ونطلق الرد مبكرًا على النتائج المستقرة."""
         try:
             last_sent_text = ""
-            # وقت بين إطلاقين متتاليين حتى لا نكرر الردود
-            min_emit_gap = 1.5  # ثوانٍ
+            min_emit_gap = 1.5  # ثواني بين إطلاقين
             for resp in speech_client.streaming_recognize(streaming_config, request_iter()):
                 for result in resp.results:
-                    # المخرجات المؤقتة تأتي بلا confidence ولكن معها stability (غالبًا)
                     alt = result.alternatives[0]
                     transcript = (alt.transcript or "").strip()
                     if not transcript:
                         continue
 
-                    # لا نرد إذا لدينا رد معلّق قيد الإرسال/التشغيل
                     state = CALL_STATE.get(call_sid, {})
+                    # لو عندنا رد قيد الإرسال، تجاهل أي transcriptions حتى يُعاد فتح /voice
                     if state.get("awaiting_reply"):
                         continue
 
                     now = time.time()
-                    # شرط الإطلاق:
                     emit = False
                     if result.is_final:
                         emit = True
                     else:
                         stab = getattr(result, "stability", 0.0) or 0.0
-                        # إذا النص مستقر أو طويل بما يكفي نعتبره جملة مفيدة
                         if stab >= 0.85 or len(transcript) >= 14:
-                            # لا نطلق نفس النص المتكرر
                             if transcript != last_sent_text and (now - state.get("last_emit_ts", 0.0) > min_emit_gap):
                                 emit = True
 
                     if emit:
                         last_sent_text = transcript
-                        # علّم أننا بصدد إرسال ردّ (حتى لا نكرر)
                         state["awaiting_reply"] = True
                         state["last_emit_ts"] = now
                         CALL_STATE[call_sid] = state
                         log.info(f"STT FINAL* [{call_sid}]: {transcript}")
-                        asyncio.run_coroutine_threadsafe(
-                            _handle_user_turn(call_sid, transcript),
-                            loop
-                        )
+                        asyncio.run_coroutine_threadsafe(_handle_user_turn(call_sid, transcript), loop)
         except Exception as e:
             log.exception(f"STT thread error: {e}")
 
@@ -251,15 +263,20 @@ async def media(ws: WebSocket):
         t.join(timeout=1)
         await ws.close()
 
-# ====== منطق الحوار ======
+# ================== منطق الحوار ==================
 async def _handle_user_turn(call_sid: str, user_text: str):
     log.info(f"HANDLE TURN [{call_sid}]: '{user_text}'")
 
+    # 1) استنتاج النية + الرد
     intent, tool_called, tool_result, reply_text = await _llm_plan_and_reply(user_text)
+
+    # 2) تشكيل عربي وتحسين الإلقاء
     prepared_text = await _arabic_diacritize_and_style(reply_text)
+
+    # 3) توليد TTS إلى mp3
     mp3_url = await _synthesize_tts(prepared_text)
 
-    # أرسل الرد بينما المكالمة لا تزال In-Progress
+    # 4) إرسال الرد فورًا عبر تحديث المكالمة (طالما in-progress)
     if twilio_client and call_sid:
         try:
             if mp3_url:
@@ -282,10 +299,10 @@ async def _handle_user_turn(call_sid: str, user_text: str):
         except TwilioException as e:
             log.exception(f"Twilio update error [{call_sid}]: {e}")
 
-    # حدّث الحالة وسجّل
+    # 5) تحديث الحالة + السجل
     state = CALL_STATE.get(call_sid, {"turn": 0})
     state["turn"] = state.get("turn", 0) + 1
-    # ما زلنا ننتظر Redirect يفتح ستريم جديد، بعدها سنسمح برد جديد
+    # ننتظر Redirect ليعيد فتح /voice ثم نجعل awaiting_reply=False هناك
     state["awaiting_reply"] = True
     state["last_emit_ts"] = time.time()
     CALL_STATE[call_sid] = state
@@ -298,8 +315,8 @@ async def _llm_plan_and_reply(user_text: str):
         return intent, tool_called, tool_result, "من فضلك أعد طلبك لاحقاً."
 
     SYSTEM = (
-        "أنت مساعد اتصال لشركة اتصالات سعودية. استنتج النية بإيجاز، واختر أداة واحدة إن لزم، "
-        "ثم اكتب جواباً موجزاً مهذباً بالعربية الفصحى لا يتجاوز ثلاث جُمل."
+        "أنت مساعد اتصال لشركة اتصالات سعودية. استنتج نية المتصل بإيجاز، واختر أداة واحدة إن لزم، "
+        "ثم اكتب جوابًا مهذبًا بالعربية الفصحى لا يتجاوز ثلاث جمل."
     )
 
     tools = [
@@ -352,14 +369,14 @@ async def _llm_plan_and_reply(user_text: str):
 
     return intent, tool_called, (json.dumps(tool_result, ensure_ascii=False) if tool_result else None), answer
 
-# أدوات وهمية
+# أدوات وهمية (اربطها لاحقًا بقاعدة بياناتك/خدماتك)
 def _mock_lookup_balance(customer_id: str):
     return {"customer_id": customer_id or "12345", "balance": 150.50}
 
 def _mock_open_ticket(summary: str):
     return f"T-{str(uuid.uuid4())[:8]}"
 
-# تشكيل + أسلوب الإلقاء
+# تشكيل عربي + أسلوب إلقاء
 async def _arabic_diacritize_and_style(text: str) -> str:
     if not openai_client:
         return text
@@ -380,25 +397,25 @@ async def _arabic_diacritize_and_style(text: str) -> str:
         log.exception(f"Diacritize error: {e}")
         return text
 
-# توليد TTS إلى ملف mp3 (من دون استخدام معامل format لتوافق المكتبة)
+# TTS إلى ملف mp3 في public/tts
 async def _synthesize_tts(text: str) -> Optional[str]:
     if not openai_client:
         return None
     try:
-        # واجهة TTS قد تعيد كائن بايتات مباشرة
+        # لا نستخدم with_streaming_response لتجنّب مشاكل التوافق
         resp = openai_client.audio.speech.create(
             model="gpt-4o-mini-tts",
             voice="alloy",
             input=text,
+            format="mp3"  # هذه مدعومة في الإصدارات الحديثة من بايثون/المكتبة لديك (حسب سجلاتك 200 OK)
         )
-        # حاول استخراج البايتات
+        # استخراج البايتات
         audio_bytes = None
         if hasattr(resp, "read"):
             audio_bytes = resp.read()
         elif hasattr(resp, "content"):
             audio_bytes = resp.content
         else:
-            # بعض الإصدارات تُرجع generator
             try:
                 audio_bytes = b"".join(resp.iter_bytes())
             except Exception:
