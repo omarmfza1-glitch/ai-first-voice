@@ -116,7 +116,7 @@ async def voice(request: Request):
 <Response>
   <Start><Stream url="{wss_url}"/></Start>
   <Say language="ar-SA" voice="Polly.Zeina">مرحبًا بكم في سمارت كول سنتر. تفضّل بالحديث، أنا أُصغي إليك.</Say>
-  <Pause length="30"/>
+  <Pause length="60"/>
 </Response>
 """.strip()
     log.info(f"/voice: started call_sid={call_sid} -> stream {wss_url}")
@@ -133,20 +133,19 @@ async def media(ws: WebSocket):
     call_sid = (qd.get("CallSid") or qd.get("callSid") or [""])[0]
     log.info(f"WS connected: call_sid={call_sid}")
 
-    # إعداد Google STT (العربية لا تدعم model=phone_call)
+    # إعداد Google STT — لا نستخدم phone_call للعربية، ولا alternative_language_codes
     speech_client = speech.SpeechClient()
     recognition_config = speech.RecognitionConfig(
         encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
         sample_rate_hertz=8000,
         language_code="ar-SA",
-        model="default",                      # ← مهم
+        model="default",
         enable_automatic_punctuation=True,
-        # use_enhanced غير مدعومة هنا
     )
     streaming_config = speech.StreamingRecognitionConfig(
         config=recognition_config,
         interim_results=True,
-        single_utterance=True,                # ← يُنهي الجملة سريعًا عند الوقفة
+        single_utterance=False,     # ← ✅ رجّعناها False لأن True غير مدعوم
     )
 
     # Queue + مولّد: يرسل الصوت فقط (نسخة المكتبة هذه تتوقع config كوسيط منفصل)
@@ -167,6 +166,7 @@ async def media(ws: WebSocket):
             # نمرر streaming_config + المولّد (requests)
             for resp in speech_client.streaming_recognize(streaming_config, request_iter()):
                 for result in resp.results:
+                    # حتى مع single_utterance=False، جوجل يُرسل نتائج نهائية دورياً
                     if result.is_final:
                         transcript = result.alternatives[0].transcript.strip()
                         if transcript:
@@ -354,7 +354,7 @@ async def _synthesize_tts(text: str) -> Optional[str]:
         file_id = f"{uuid.uuid4()}.mp3"
         path = os.path.join("public", "tts", file_id)
 
-        # التوقيع المتوافق حاليًا: voice + input فقط
+        # التوقيع المتوافق: voice + input فقط
         with openai_client.audio.speech.with_streaming_response.create(
             model="gpt-4o-mini-tts",
             voice="alloy",
