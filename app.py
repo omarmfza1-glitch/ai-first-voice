@@ -1,4 +1,4 @@
-# app.py — مركز اتصال ذكي متكامل (النسخة النهائية v5 - غير متزامن بالكامل)
+# app.py — مركز اتصال ذكي متكامل (النسخة النهائية v6 - تصحيح SyntaxError)
 # -*- coding: utf-8 -*-
 
 # ============================================================================
@@ -43,16 +43,17 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN else None
 twilio_validator = RequestValidator(TWILIO_AUTH_TOKEN) if TWILIO_AUTH_TOKEN else None
 
-# ---- التغيير الجذري هنا: استخدام عميل Google STT غير المتزامن ----
+# ---- تصحيح SyntaxError هنا ----
 speech_async_client = None
+speech_types = None
 try:
     GCP_KEY_JSON_STR = os.getenv("GCP_KEY_JSON")
     if GCP_KEY_JSON_STR:
         with open("gcp.json", "w", encoding="utf-8") as f: f.write(GCP_KEY_JSON_STR)
         os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.abspath("gcp.json")
-    # استيراد واستخدام النسخة غير المتزامنة
+    
     from google.cloud.speech_v1p1beta1.services import speech
-    from google.cloud.speech_v1p1beta1.types importcloud_speech
+    from google.cloud.speech_v1p1beta1 import types as speech_types
     speech_async_client = speech.SpeechAsyncClient()
     logger.info("✅ Google Cloud Speech Async Client initialized successfully.")
 except (ImportError, Exception) as e:
@@ -98,7 +99,7 @@ def log_conversation(**kwargs):
     except Exception as e: logger.error(f"Failed to log conversation: {e}")
 
 # ============================================================================
-# 7. نقاط النهاية الرئيسية - مع معالج WebSocket غير متزامن بالكامل
+# 7. نقاط النهاية الرئيسية (تم تصحيحها)
 # ============================================================================
 @app.post("/twilio/voice")
 async def voice_handler(request: Request, x_twilio_signature: Optional[str] = Header(None)):
@@ -128,22 +129,22 @@ async def media_stream_handler(ws: WebSocket):
                 event = message.get("event")
                 if event == "start":
                     start_payload = message.get("start", {})
-                    call_sid = start_payload.get("customParameters", {}).get("CallSid")
+                    call_sid = start_payload.get("customParameters", {}).get("callSid")
                     if not call_sid: logger.error("No callSid in start event"); break
                     logger.info(f"▶️ Twilio stream started for call: {call_sid}")
                 elif event == "media":
                     chunk = audioop.ulaw2lin(base64.b64decode(message["media"]["payload"]), 2)
-                    yieldcloud_speech.StreamingRecognizeRequest(audio_content=chunk)
+                    yield speech_types.StreamingRecognizeRequest(audio_content=chunk)
                 elif event == "stop":
                     logger.info(f"⏹️ Twilio stream stopped for {call_sid}."); break
             except WebSocketDisconnect:
                 logger.info("WebSocket disconnected during generation."); break
         logger.info("Audio generator finished.")
 
-    if speech_async_client and not TEST_MODE:
+    if speech_async_client and speech_types and not TEST_MODE:
         try:
-            streaming_config =cloud_speech.StreamingRecognitionConfig(
-                config=cloud_speech.RecognitionConfig(encoding=cloud_speech.RecognitionConfig.AudioEncoding.LINEAR16, sample_rate_hertz=8000, language_code="ar-SA", model="telephony", use_enhanced=True, enable_automatic_punctuation=True),
+            streaming_config = speech_types.StreamingRecognitionConfig(
+                config=speech_types.RecognitionConfig(encoding=speech_types.RecognitionConfig.AudioEncoding.LINEAR16, sample_rate_hertz=8000, language_code="ar-SA", model="telephony", use_enhanced=True, enable_automatic_punctuation=True),
                 interim_results=False
             )
             responses = await speech_async_client.streaming_recognize(config=streaming_config, requests=request_generator())
@@ -209,7 +210,7 @@ async def _llm_plan_and_reply(user_text: str, call_state: dict) -> tuple:
 async def _synthesize_tts(text: str) -> Optional[str]:
     if not openai_client or not text: return None
     try:
-        styled_text = text # يمكن إضافة التشكيل هنا إذا أردت
+        styled_text = text
         file_id = f"{uuid.uuid4()}.mp3"; out_path = os.path.join("public", "tts", file_id)
         response = openai_client.audio.speech.create(model="tts-1", voice="alloy", input=styled_text); response.stream_to_file(out_path)
         url = f"{BASE_URL}/public/tts/{file_id}"; logger.info(f"✅ TTS generated: {url}"); return url
