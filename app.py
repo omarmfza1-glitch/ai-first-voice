@@ -316,6 +316,8 @@ async def voice_handler(request: Request):
 @app.websocket("/media")
 async def media_stream(ws: WebSocket):
     """WebSocket لاستقبال البث الصوتي من Twilio"""
+    global GOOGLE_STT_AVAILABLE  # استخدام المتغير العام
+    
     await ws.accept()
     
     # استخراج call_sid من الـ query string
@@ -334,8 +336,9 @@ async def media_stream(ws: WebSocket):
     stt_task = None
     speech_client = None
     test_task = None
+    stt_available = GOOGLE_STT_AVAILABLE  # نسخة محلية للقراءة
     
-    if GOOGLE_STT_AVAILABLE and not TEST_MODE:
+    if stt_available and not TEST_MODE:
         try:
             speech_client = speech.SpeechClient()
             streaming_config = speech.StreamingRecognitionConfig(
@@ -358,10 +361,10 @@ async def media_stream(ws: WebSocket):
             logger.info("✅ Google STT initialized for call")
         except Exception as e:
             logger.error(f"Failed to initialize STT: {e}")
-            GOOGLE_STT_AVAILABLE = False
+            stt_available = False
     
     # وضع الاختبار إذا لم يكن STT متاحًا
-    if not GOOGLE_STT_AVAILABLE or TEST_MODE:
+    if not stt_available or TEST_MODE:
         logger.warning("⚠️ Running in TEST MODE or STT unavailable - using simulated input")
         test_task = asyncio.create_task(_simulate_user_input(call_sid, delay=5))
     
@@ -475,6 +478,10 @@ async def _consume_stt_responses(stt_responses, get_call_sid):
 
 async def _simulate_user_input(call_sid: str, delay: int = 5):
     """محاكاة إدخال المستخدم للاختبار"""
+    if not call_sid:
+        logger.warning("No call_sid for simulation")
+        return
+        
     test_phrases = [
         "السلام عليكم، أريد معرفة رصيدي",
         "عندي مشكلة في الإنترنت",
@@ -484,9 +491,12 @@ async def _simulate_user_input(call_sid: str, delay: int = 5):
     
     await asyncio.sleep(delay)
     
-    for phrase in test_phrases:
-        logger.info(f"🧪 TEST MODE: Simulating user input: {phrase}")
-        await _handle_user_turn(call_sid, phrase)
+    for i, phrase in enumerate(test_phrases):
+        logger.info(f"🧪 TEST MODE: Simulating user input [{i+1}/{len(test_phrases)}]: {phrase}")
+        try:
+            await _handle_user_turn(call_sid, phrase)
+        except Exception as e:
+            logger.error(f"Error in simulated input: {e}")
         await asyncio.sleep(10)  # انتظار 10 ثواني بين كل جملة
 
 # ----------------------------------------------------------------------------
