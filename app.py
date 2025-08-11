@@ -57,6 +57,7 @@ BASE_URL = os.getenv("BASE_URL", f"http://127.0.0.1:{PORT}")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+TEST_MODE = os.getenv("TEST_MODE", "false").lower() == "true"
 
 # ----------------------------------------------------------------------------
 # قاعدة البيانات
@@ -142,13 +143,16 @@ from twilio.base.exceptions import TwilioException
 from openai import OpenAI
 
 # Google Speech-to-Text
+GOOGLE_STT_AVAILABLE = False
 try:
     from google.cloud import speech_v1p1beta1 as speech
     from google.cloud.speech_v1p1beta1 import StreamingRecognizeRequest
     GOOGLE_STT_AVAILABLE = True
+    logger.info("✅ Google Cloud Speech module loaded")
 except ImportError:
     logger.warning("⚠️ Google Cloud Speech not available. Install google-cloud-speech")
-    GOOGLE_STT_AVAILABLE = False
+except Exception as e:
+    logger.error(f"❌ Error loading Google Cloud Speech: {e}")
 
 # OpenAI Client
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
@@ -328,8 +332,10 @@ async def media_stream(ws: WebSocket):
     # تهيئة Google STT إذا كان متاحًا
     req_iter = None
     stt_task = None
+    speech_client = None
+    test_task = None
     
-    if GOOGLE_STT_AVAILABLE:
+    if GOOGLE_STT_AVAILABLE and not TEST_MODE:
         try:
             speech_client = speech.SpeechClient()
             streaming_config = speech.StreamingRecognitionConfig(
@@ -352,36 +358,73 @@ async def media_stream(ws: WebSocket):
             logger.info("✅ Google STT initialized for call")
         except Exception as e:
             logger.error(f"Failed to initialize STT: {e}")
+            GOOGLE_STT_AVAILABLE = False
+    
+    # وضع الاختبار إذا لم يكن STT متاحًا
+    if not GOOGLE_STT_AVAILABLE or TEST_MODE:
+        logger.warning("⚠️ Running in TEST MODE or STT unavailable - using simulated input")
+        test_task = asyncio.create_task(_simulate_user_input(call_sid, delay=5))
     
     try:
         while True:
             msg = await ws.receive_text()
-            event = json.loads(msg)
+            try:
+                event = json.loads(msg)
+            except json.JSONDecodeError:
+                logger.warning(f"Invalid JSON received: {msg[:100]}")
+                continue
+                
             etype = event.get("event")
             
             if etype == "start":
                 start = event.get("start", {})
-                cp = start.get("customParameters") or ""
+                cp = start.get("customParameters")
+                
+                # معالجة customParameters - قد يكون dict أو string
                 if cp:
-                    qs = parse_qs(cp)
-                    if not call_sid:
-                        call_sid = (qs.get("callSid") or [""])[0] or start.get("callSid", "")
+                    if isinstance(cp, dict):
+                        # إذا كان dictionary مباشرة
+                        if not call_sid:
+                            call_sid = cp.get("callSid", "") or start.get("callSid", "")
+                    elif isinstance(cp, str):
+                        # إذا كان string، نحلله
+                        try:
+                            qs = parse_qs(cp)
+                            if not call_sid:
+                                call_sid = (qs.get("callSid") or [""])[0] or start.get("callSid", "")
+                        except Exception as e:
+                            logger.warning(f"Failed to parse customParameters: {e}")
+                            if not call_sid:
+                                call_sid = start.get("callSid", "")
                 else:
                     if not call_sid:
                         call_sid = start.get("callSid", "")
+                        
                 logger.info(f"▶️ Stream started: call_sid={call_sid}")
                 
             elif etype == "media":
                 # معالجة البيانات الصوتية
-                b64 = event.get("media", {}).get("payload")
+                media_payload = event.get("media", {})
+                b64 = media_payload.get("payload")
+                
                 if b64 and req_iter:
-                    ulaw = base64.b64decode(b64)
-                    pcm = audioop.ulaw2lin(ulaw, 2)  # تحويل إلى 16-bit PCM
-                    req_iter.push(pcm)
-                    
+                    try:
+                        ulaw = base64.b64decode(b64)
+                        pcm = audioop.ulaw2lin(ulaw, 2)  # تحويل إلى 16-bit PCM
+                        req_iter.push(pcm)
+                    except Exception as e:
+                        logger.warning(f"Error processing audio: {e}")
+                        
             elif etype == "stop":
                 logger.info(f"⏹️ Stream stopped: call_sid={call_sid}")
                 break
+                
+            elif etype == "mark":
+                # Twilio mark events - يمكن تجاهلها
+                logger.debug(f"Mark event: {event.get('mark', {})}")
+                
+            elif etype == "connected":
+                logger.info(f"✅ Stream connected: call_sid={call_sid}")
                 
     except WebSocketDisconnect:
         logger.info(f"🔌 WebSocket disconnected: call_sid={call_sid}")
@@ -393,12 +436,18 @@ async def media_stream(ws: WebSocket):
         if stt_task:
             try:
                 await stt_task
+            except Exception as e:
+                logger.warning(f"Error closing STT task: {e}")
+        if test_task:
+            try:
+                test_task.cancel()
             except Exception:
                 pass
         try:
             await ws.close()
         except Exception:
             pass
+        logger.info(f"WebSocket cleanup completed for {call_sid}")
 
 async def _aiter(sync_iterable):
     """تحويل iterator متزامن إلى async"""
@@ -413,13 +462,32 @@ async def _aiter(sync_iterable):
 
 async def _consume_stt_responses(stt_responses, get_call_sid):
     """معالجة نتائج التعرف على الكلام"""
-    async for resp in _aiter(stt_responses):
-        for result in resp.results:
-            transcript = result.alternatives[0].transcript.strip()
-            if result.is_final and transcript:
-                call_sid = get_call_sid()
-                logger.info(f"🎤 STT Final [{call_sid}]: {transcript}")
-                await _handle_user_turn(call_sid, transcript)
+    try:
+        async for resp in _aiter(stt_responses):
+            for result in resp.results:
+                transcript = result.alternatives[0].transcript.strip()
+                if result.is_final and transcript:
+                    call_sid = get_call_sid()
+                    logger.info(f"🎤 STT Final [{call_sid}]: {transcript}")
+                    await _handle_user_turn(call_sid, transcript)
+    except Exception as e:
+        logger.error(f"STT processing error: {e}")
+
+async def _simulate_user_input(call_sid: str, delay: int = 5):
+    """محاكاة إدخال المستخدم للاختبار"""
+    test_phrases = [
+        "السلام عليكم، أريد معرفة رصيدي",
+        "عندي مشكلة في الإنترنت",
+        "ما هي باقتي الحالية؟",
+        "شكراً لك"
+    ]
+    
+    await asyncio.sleep(delay)
+    
+    for phrase in test_phrases:
+        logger.info(f"🧪 TEST MODE: Simulating user input: {phrase}")
+        await _handle_user_turn(call_sid, phrase)
+        await asyncio.sleep(10)  # انتظار 10 ثواني بين كل جملة
 
 # ----------------------------------------------------------------------------
 # معالجة الذكاء الاصطناعي والأدوات
@@ -859,7 +927,8 @@ async def health_check():
             "openai": bool(openai_client),
             "twilio": bool(twilio_client),
             "google_stt": GOOGLE_STT_AVAILABLE
-        }
+        },
+        "test_mode": TEST_MODE
     }
     
     # فحص قاعدة البيانات
@@ -1062,11 +1131,73 @@ async def get_call_conversation(call_sid: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 # ----------------------------------------------------------------------------
+# نقاط نهاية الاختبار
+# ----------------------------------------------------------------------------
+
+@app.post("/test/simulate-call")
+async def simulate_call(phone: str = "+966501234567"):
+    """محاكاة مكالمة للاختبار"""
+    if not TEST_MODE:
+        return JSONResponse(
+            {"error": "Test mode is disabled. Set TEST_MODE=true in environment variables"},
+            status_code=403
+        )
+    
+    # إنشاء call_sid وهمي
+    test_call_sid = f"TEST_{uuid.uuid4().hex[:8]}"
+    
+    # تهيئة حالة المكالمة
+    CALL_STATE[test_call_sid] = {
+        "turn": 0,
+        "from_number": phone,
+        "start_time": datetime.datetime.utcnow()
+    }
+    
+    # بدء محاكاة في الخلفية
+    asyncio.create_task(_run_test_scenario(test_call_sid))
+    
+    return JSONResponse({
+        "status": "Test started",
+        "call_sid": test_call_sid,
+        "message": "Check logs for results",
+        "phone": phone
+    })
+
+async def _run_test_scenario(call_sid: str):
+    """تشغيل سيناريو اختبار كامل"""
+    test_scenarios = [
+        ("السلام عليكم", 2),
+        ("أريد معرفة رصيدي", 3),
+        ("عندي مشكلة في الإنترنت بطيء", 3),
+        ("ما هي باقتي الحالية؟", 3),
+        ("شكراً لك", 2)
+    ]
+    
+    for user_input, delay in test_scenarios:
+        logger.info(f"🧪 TEST [{call_sid}]: User says: {user_input}")
+        await _handle_user_turn(call_sid, user_input)
+        await asyncio.sleep(delay)
+    
+    logger.info(f"🧪 TEST [{call_sid}]: Scenario completed")
+    
+    # تنظيف
+    if call_sid in CALL_STATE:
+        del CALL_STATE[call_sid]
+
+# ----------------------------------------------------------------------------
 # تشغيل التطبيق
 # ----------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import uvicorn
+    import sys
+    
+    # وضع الاختبار المباشر من سطر الأوامر
+    if len(sys.argv) > 1 and sys.argv[1] == "test":
+        TEST_MODE = True
+        logger.info("=" * 60)
+        logger.info("🧪 RUNNING IN TEST MODE")
+        logger.info("=" * 60)
     
     logger.info("=" * 50)
     logger.info("🚀 Starting Smart Call Center")
@@ -1075,6 +1206,7 @@ if __name__ == "__main__":
     logger.info(f"✅ OpenAI: {'Connected' if openai_client else '❌ Not configured'}")
     logger.info(f"✅ Twilio: {'Connected' if twilio_client else '❌ Not configured'}")
     logger.info(f"✅ Google STT: {'Available' if GOOGLE_STT_AVAILABLE else '❌ Not available'}")
+    logger.info(f"🧪 Test Mode: {'ON' if TEST_MODE else 'OFF'}")
     logger.info("=" * 50)
     
     uvicorn.run(
