@@ -294,11 +294,9 @@ def _mock_open_ticket(summary: str):
 async def _arabic_diacritize_and_style(text: str) -> str:
     if not openai_client:
         return text
-    prompt = (
-        "أضف التشكيل العربي للنص التالي بدقة وتهذيب، وأدرج إشارات توقف مناسبة مثل [pause=300ms] دون مبالغة.
-
-" f"النص: {text}"
-    )
+    prompt = f"""أضف التشكيل العربي للنص التالي بدقة وتهذيب، وأدرج إشارات توقف مناسبة مثل [pause=300ms] دون مبالغة.
+النص: {text}
+"""
     try:
         comp = openai_client.chat.completions.create(
             model="gpt-4o-mini",
@@ -309,6 +307,7 @@ async def _arabic_diacritize_and_style(text: str) -> str:
         return comp.choices[0].message.content.strip()
     except Exception:
         return text
+
 
 # TTS متوافق مع مكتبة OpenAI (إزالة الوسيط format)
 async def _synthesize_tts(text: str) -> Optional[str]:
@@ -381,3 +380,4 @@ async def health():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=PORT)
+
