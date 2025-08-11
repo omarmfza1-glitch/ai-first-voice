@@ -349,7 +349,7 @@ async def media_stream(ws: WebSocket):
                     # تم إزالة alternative_language_codes لأنه غير مدعوم
                     # alternative_language_codes=["en-US"],
                     use_enhanced=True,
-                    model="phone_call",
+                    model="latest_long",
                     enable_automatic_punctuation=True,
                     enable_word_time_offsets=False,
                     profanity_filter=False,
@@ -1275,3 +1275,4 @@ if __name__ == "__main__":
         log_level="info",
         access_log=True
     )
+
