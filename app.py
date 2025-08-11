@@ -383,7 +383,8 @@ async def media_stream(ws: WebSocket):
     # وضع الاختبار إذا لم يكن STT متاحًا
     if not stt_available or TEST_MODE:
         logger.warning("⚠️ Running in TEST MODE or STT unavailable - using simulated input")
-        test_task = asyncio.create_task(_simulate_user_input(call_sid, delay=5))
+        # تأجيل بدء المحاكاة حتى نحصل على call_sid
+        test_task = None
     
     try:
         while True:
@@ -422,6 +423,11 @@ async def media_stream(ws: WebSocket):
                         
                 logger.info(f"▶️ Stream started: call_sid={call_sid}")
                 
+                # بدء المحاكاة بعد الحصول على call_sid
+                if (not stt_available or TEST_MODE) and call_sid and not test_task:
+                    logger.info(f"🧪 Starting test simulation for call {call_sid}")
+                    test_task = asyncio.create_task(_simulate_user_input(call_sid, delay=3))
+                
             elif etype == "media":
                 # معالجة البيانات الصوتية
                 media_payload = event.get("media", {})
@@ -432,13 +438,20 @@ async def media_stream(ws: WebSocket):
                         ulaw = base64.b64decode(b64)
                         pcm = audioop.ulaw2lin(ulaw, 2)  # تحويل إلى 16-bit PCM
                         req_iter.push(pcm)
-                        # سجل للتأكد من استقبال البيانات
-                        if len(pcm) > 0:
-                            logger.debug(f"Audio chunk received: {len(pcm)} bytes")
+                        # سجل للتأكد من استقبال البيانات (مرة واحدة فقط)
+                        if not hasattr(req_iter, '_logged'):
+                            logger.debug(f"Audio streaming active: receiving data")
+                            req_iter._logged = True
                     except Exception as e:
                         logger.warning(f"Error processing audio: {e}")
+                elif b64 and not req_iter and TEST_MODE:
+                    # في وضع الاختبار، تجاهل الصوت بهدوء
+                    pass
                 elif b64 and not req_iter:
-                    logger.warning("Audio received but STT not initialized")
+                    # سجل التحذير مرة واحدة فقط
+                    if not hasattr(ws, '_audio_warning_logged'):
+                        logger.warning("Audio received but STT not initialized")
+                        ws._audio_warning_logged = True
                         
             elif etype == "stop":
                 logger.info(f"⏹️ Stream stopped: call_sid={call_sid}")
