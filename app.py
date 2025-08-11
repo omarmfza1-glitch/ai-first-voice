@@ -1,37 +1,56 @@
-# app.py — Twilio Media Streams + Google STT + OpenAI (Arabic)
+# app.py — مركز اتصال ذكي متكامل مع Twilio + Google STT + OpenAI
 # -*- coding: utf-8 -*-
 
-import os, io, base64, uuid, sqlite3, datetime, json, asyncio, logging, queue
-from typing import Optional
+import os
+import io
+import base64
+import uuid
+import sqlite3
+import datetime
+import json
+import asyncio
+import logging
+import queue
+from typing import Optional, Dict, Any
+from contextlib import asynccontextmanager
 
-# دعم audioop على بايثون 3.13 عبر مكتبة بديلة
+# دعم audioop على Python 3.13+
 try:
-    import audioop  # Python <= 3.12
+    import audioop
 except ModuleNotFoundError:
-    import audioop_lts as audioop  # بديل متوافق
+    import audioop_lts as audioop
 
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import Response, PlainTextResponse
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi.responses import Response, PlainTextResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from urllib.parse import urlparse, parse_qs
+import re
 
+# تحميل متغيرات البيئة
 load_dotenv()
-logging.basicConfig(level=logging.INFO)
+
+# إعداد السجلات
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger("smart-cc")
 
 # ----------------------------------------------------------------------------
-# البيئة
+# متغيرات البيئة
 # ----------------------------------------------------------------------------
+# معالجة ملف GCP من متغير بيئة
 GCP_KEY_JSON = os.getenv("GCP_KEY_JSON")
 if GCP_KEY_JSON:
     try:
         with open("gcp.json", "w", encoding="utf-8") as f:
             f.write(GCP_KEY_JSON)
         os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.abspath("gcp.json")
-        logger.info("GCP credentials written to gcp.json")
+        logger.info("✅ GCP credentials configured successfully")
     except Exception as e:
-        logger.error("Failed to write gcp.json: %s", e)
+        logger.error(f"❌ Failed to write GCP credentials: {e}")
 
 PORT = int(os.getenv("PORT", 5000))
 BASE_URL = os.getenv("BASE_URL", f"http://127.0.0.1:{PORT}")
@@ -40,64 +59,168 @@ TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 
 # ----------------------------------------------------------------------------
-# قاعدة البيانات (تسجيل الحوارات)
+# قاعدة البيانات
 # ----------------------------------------------------------------------------
 DB_PATH = os.path.join(os.path.dirname(__file__), "db.sqlite3")
 os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
-conn = sqlite3.connect(DB_PATH)
-cur = conn.cursor()
-cur.execute(
-    """
-    CREATE TABLE IF NOT EXISTS conversations (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      timestamp TEXT,
-      call_sid TEXT,
-      turn INTEGER,
-      user_text TEXT,
-      intent TEXT,
-      tool_called TEXT,
-      tool_result TEXT,
-      reply_text TEXT,
-      reply_audio_url TEXT
-    );
-    """
-)
-conn.commit()
-conn.close()
+
+def init_database():
+    """تهيئة قاعدة البيانات مع الجداول المطلوبة"""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    
+    # جدول العملاء
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS customers (
+            customer_id TEXT PRIMARY KEY,
+            name TEXT,
+            phone TEXT UNIQUE,
+            current_package TEXT,
+            account_balance REAL,
+            last_bill_date TEXT,
+            status TEXT DEFAULT 'active',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    # جدول المحادثات
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS conversations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            call_sid TEXT,
+            turn INTEGER,
+            user_text TEXT,
+            intent TEXT,
+            tool_called TEXT,
+            tool_result TEXT,
+            reply_text TEXT,
+            reply_audio_url TEXT,
+            duration_ms INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    # جدول التذاكر
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS tickets (
+            ticket_id TEXT PRIMARY KEY,
+            customer_id TEXT,
+            summary TEXT,
+            status TEXT DEFAULT 'open',
+            priority TEXT DEFAULT 'normal',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    # إضافة بيانات تجريبية للعملاء
+    sample_customers = [
+        ("966501234567", "أحمد محمد", "966501234567", "باقة البلاتينيوم", 350.75, "2025-01-15"),
+        ("966502345678", "فاطمة علي", "966502345678", "باقة الذهبية", 150.50, "2025-01-10"),
+        ("966503456789", "خالد سعود", "966503456789", "باقة الفضية", 75.25, "2025-01-20"),
+    ]
+    
+    for customer in sample_customers:
+        cur.execute("""
+            INSERT OR IGNORE INTO customers (customer_id, name, phone, current_package, account_balance, last_bill_date)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, customer)
+    
+    conn.commit()
+    conn.close()
+    logger.info("✅ Database initialized successfully")
+
+# تهيئة قاعدة البيانات عند بدء التطبيق
+init_database()
 
 # ----------------------------------------------------------------------------
-# خدمات خارجية
+# الخدمات الخارجية
 # ----------------------------------------------------------------------------
 from twilio.rest import Client as TwilioClient
 from twilio.base.exceptions import TwilioException
 from openai import OpenAI
-from google.cloud import speech_v1p1beta1 as speech
-from google.cloud.speech_v1p1beta1 import StreamingRecognizeRequest
-from openai.types.chat import ChatCompletionMessageToolCall
 
+# Google Speech-to-Text
+try:
+    from google.cloud import speech_v1p1beta1 as speech
+    from google.cloud.speech_v1p1beta1 import StreamingRecognizeRequest
+    GOOGLE_STT_AVAILABLE = True
+except ImportError:
+    logger.warning("⚠️ Google Cloud Speech not available. Install google-cloud-speech")
+    GOOGLE_STT_AVAILABLE = False
+
+# OpenAI Client
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) if (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN) else None
+if not openai_client:
+    logger.warning("⚠️ OpenAI API key not configured")
+
+# Twilio Client
+twilio_client = None
+if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
+    try:
+        twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        logger.info("✅ Twilio client initialized")
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize Twilio: {e}")
 
 # ----------------------------------------------------------------------------
-# FastAPI
+# FastAPI Application
 # ----------------------------------------------------------------------------
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifecycle management for the application"""
+    logger.info("🚀 Starting Smart Call Center...")
+    yield
+    logger.info("👋 Shutting down Smart Call Center...")
+
+app = FastAPI(
+    title="Smart Call Center API",
+    description="مركز اتصال ذكي بالذكاء الاصطناعي",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Static files for TTS audio
 os.makedirs("public/tts", exist_ok=True)
 app.mount("/public", StaticFiles(directory="public"), name="public")
 
 # حالة المكالمات في الذاكرة
-CALL_STATE: dict[str, dict] = {}
+CALL_STATE: Dict[str, Dict[str, Any]] = {}
 
 # ----------------------------------------------------------------------------
 # أدوات مساعدة
 # ----------------------------------------------------------------------------
 
-def log_conv(call_sid: str, turn: int, user_text: str, intent: str, tool_called: str, tool_result: str, reply_text: str, reply_audio_url: str):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO conversations (timestamp, call_sid, turn, user_text, intent, tool_called, tool_result, reply_text, reply_audio_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (
+def log_conversation(
+    call_sid: str, 
+    turn: int, 
+    user_text: str, 
+    intent: str, 
+    tool_called: str, 
+    tool_result: str, 
+    reply_text: str, 
+    reply_audio_url: str,
+    duration_ms: int = 0
+):
+    """تسجيل تفاصيل المحادثة في قاعدة البيانات"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO conversations 
+            (timestamp, call_sid, turn, user_text, intent, tool_called, tool_result, reply_text, reply_audio_url, duration_ms)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
             datetime.datetime.utcnow().isoformat(),
             call_sid,
             turn,
@@ -107,13 +230,16 @@ def log_conv(call_sid: str, turn: int, user_text: str, intent: str, tool_called:
             tool_result or "",
             reply_text or "",
             reply_audio_url or "",
-        ),
-    )
-    conn.commit()
-    conn.close()
+            duration_ms
+        ))
+        conn.commit()
+        conn.close()
+        logger.info(f"📝 Logged conversation turn {turn} for call {call_sid}")
+    except Exception as e:
+        logger.error(f"Failed to log conversation: {e}")
 
-# مولّد متزامن صالح لـ gRPC (يُغذَّى من الـWS)
 class SpeechRequestIterator:
+    """مولِّد متزامن للطلبات الصوتية لـ Google STT"""
     def __init__(self):
         self.q: queue.Queue[Optional[bytes]] = queue.Queue()
         self.closed = False
@@ -135,30 +261,42 @@ class SpeechRequestIterator:
             yield StreamingRecognizeRequest(audio_content=chunk)
 
 # ----------------------------------------------------------------------------
-# 1) Twilio يبدأ المكالمة -> نعيد TwiML مع <Start><Stream> وتمرير callSid
+# نقاط النهاية الرئيسية
 # ----------------------------------------------------------------------------
+
 @app.post("/voice")
-async def voice(request: Request):
+async def voice_handler(request: Request):
+    """معالج Twilio الرئيسي للمكالمات الواردة"""
     form = await request.form()
     call_sid = form.get("CallSid", "")
-
+    from_number = form.get("From", "")
+    
+    # تحديث حالة المكالمة
     state = CALL_STATE.get(call_sid)
     if state is None:
-        CALL_STATE[call_sid] = {"turn": 0}
+        CALL_STATE[call_sid] = {
+            "turn": 0,
+            "from_number": from_number,
+            "start_time": datetime.datetime.utcnow()
+        }
         first_turn = True
     else:
         first_turn = state.get("turn", 0) == 0
-
+    
+    # إعداد WebSocket URL
     ws_host = urlparse(BASE_URL).netloc or request.url.netloc
     wss_base = f"wss://{ws_host}/media"
-
-    say_block = (
-        '\n  <Say language="ar-SA" voice="Polly.Zeina">مرحبًا بكم في سمارت كول سنتر. تفضّل بالحديث، أنا أُصغي إليك.</Say>'
-        if first_turn
-        else ""
-    )
-
-    twiml = f"""
+    
+    # التحية الأولية
+    say_block = ""
+    if first_turn:
+        say_block = """
+  <Say language="ar-SA" voice="Polly.Zeina">
+    مرحبًا بكم في مركز الاتصال الذكي. 
+    تفضّل بالحديث، أنا أُصغي إليك.
+  </Say>"""
+    
+    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Start>
     <Stream url="{wss_base}" track="inbound_track">
@@ -166,20 +304,17 @@ async def voice(request: Request):
     </Stream>
   </Start>{say_block}
   <Pause length="60"/>
-</Response>
-""".strip()
-
-    logger.info("/voice: started call_sid=%s -> stream %s (first_turn=%s)", call_sid, wss_base, first_turn)
+</Response>""".strip()
+    
+    logger.info(f"📞 Voice handler: call_sid={call_sid}, first_turn={first_turn}")
     return Response(content=twiml, media_type="text/xml; charset=utf-8")
 
-# ----------------------------------------------------------------------------
-# 2) WebSocket لاستقبال الصوت من Twilio Media Streams
-# ----------------------------------------------------------------------------
 @app.websocket("/media")
-async def media(ws: WebSocket):
+async def media_stream(ws: WebSocket):
+    """WebSocket لاستقبال البث الصوتي من Twilio"""
     await ws.accept()
-
-    # قد يكون callSid في query أو في حدث start.customParameters
+    
+    # استخراج call_sid من الـ query string
     query = ws.scope.get("query_string", b"").decode()
     call_sid = ""
     if "callSid=" in query:
@@ -187,36 +322,43 @@ async def media(ws: WebSocket):
             call_sid = query.split("callSid=")[1].split("&")[0]
         except Exception:
             call_sid = ""
-
-    logger.info("WS connected: call_sid=%s", call_sid)
-
-    # تهيئة Google STT (Streaming)
-    speech_client = speech.SpeechClient()
-    streaming_config = speech.StreamingRecognitionConfig(
-        config=speech.RecognitionConfig(
-            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-            sample_rate_hertz=8000,
-            language_code="ar-SA",
-            alternative_language_codes=["en-US"],
-            use_enhanced=True,
-            model="phone_call",
-            enable_automatic_punctuation=True,
-        ),
-        interim_results=True,
-        single_utterance=False,
-    )
-
-    # مولِّد متزامن صالح لـ gRPC
-    req_iter = SpeechRequestIterator()
-    stt_responses = speech_client.streaming_recognize(streaming_config, req_iter)
-    stt_task = asyncio.create_task(_consume_stt_responses(stt_responses, lambda: call_sid))
-
+    
+    logger.info(f"🔌 WebSocket connected: call_sid={call_sid}")
+    
+    # تهيئة Google STT إذا كان متاحًا
+    req_iter = None
+    stt_task = None
+    
+    if GOOGLE_STT_AVAILABLE:
+        try:
+            speech_client = speech.SpeechClient()
+            streaming_config = speech.StreamingRecognitionConfig(
+                config=speech.RecognitionConfig(
+                    encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+                    sample_rate_hertz=8000,
+                    language_code="ar-SA",
+                    alternative_language_codes=["en-US"],
+                    use_enhanced=True,
+                    model="phone_call",
+                    enable_automatic_punctuation=True,
+                ),
+                interim_results=True,
+                single_utterance=False,
+            )
+            
+            req_iter = SpeechRequestIterator()
+            stt_responses = speech_client.streaming_recognize(streaming_config, req_iter)
+            stt_task = asyncio.create_task(_consume_stt_responses(stt_responses, lambda: call_sid))
+            logger.info("✅ Google STT initialized for call")
+        except Exception as e:
+            logger.error(f"Failed to initialize STT: {e}")
+    
     try:
         while True:
             msg = await ws.receive_text()
             event = json.loads(msg)
             etype = event.get("event")
-
+            
             if etype == "start":
                 start = event.get("start", {})
                 cp = start.get("customParameters") or ""
@@ -227,39 +369,39 @@ async def media(ws: WebSocket):
                 else:
                     if not call_sid:
                         call_sid = start.get("callSid", "")
-                logger.info("WS start: call_sid=%s", call_sid)
-
+                logger.info(f"▶️ Stream started: call_sid={call_sid}")
+                
             elif etype == "media":
+                # معالجة البيانات الصوتية
                 b64 = event.get("media", {}).get("payload")
-                if b64:
+                if b64 and req_iter:
                     ulaw = base64.b64decode(b64)
-                    pcm = audioop.ulaw2lin(ulaw, 2)  # 16-bit PCM
+                    pcm = audioop.ulaw2lin(ulaw, 2)  # تحويل إلى 16-bit PCM
                     req_iter.push(pcm)
-
+                    
             elif etype == "stop":
-                logger.info("WS stop [%s]", call_sid)
+                logger.info(f"⏹️ Stream stopped: call_sid={call_sid}")
                 break
-
-            # تجاهُل أحداث mark/dtmf/heartbeat إن وجدت
-
+                
     except WebSocketDisconnect:
-        logger.info("WS disconnect [%s]", call_sid)
+        logger.info(f"🔌 WebSocket disconnected: call_sid={call_sid}")
     except Exception as e:
-        logger.exception("WS error [%s]: %s", call_sid, e)
+        logger.exception(f"WebSocket error [{call_sid}]: {e}")
     finally:
-        req_iter.close()
-        try:
-            await stt_task
-        except Exception:
-            pass
+        if req_iter:
+            req_iter.close()
+        if stt_task:
+            try:
+                await stt_task
+            except Exception:
+                pass
         try:
             await ws.close()
         except Exception:
             pass
-        logger.info("connection closed")
 
-# لف iterator متزامن إلى async حتى لا نحجب حلقة الحدث
 async def _aiter(sync_iterable):
+    """تحويل iterator متزامن إلى async"""
     loop = asyncio.get_event_loop()
     iterator = iter(sync_iterable)
     while True:
@@ -269,200 +411,676 @@ async def _aiter(sync_iterable):
             break
         yield item
 
-# استهلاك نتائج STT
 async def _consume_stt_responses(stt_responses, get_call_sid):
+    """معالجة نتائج التعرف على الكلام"""
     async for resp in _aiter(stt_responses):
         for result in resp.results:
             transcript = result.alternatives[0].transcript.strip()
             if result.is_final and transcript:
                 call_sid = get_call_sid()
-                logger.info("STT FINAL* [%s]: %s", call_sid, transcript)
+                logger.info(f"🎤 STT Final [{call_sid}]: {transcript}")
                 await _handle_user_turn(call_sid, transcript)
 
 # ----------------------------------------------------------------------------
-# LLM + أدوات مبسطة
+# معالجة الذكاء الاصطناعي والأدوات
 # ----------------------------------------------------------------------------
-async def _llm_plan_and_reply(user_text: str):
-    intent = None; tool_called=None; tool_result=None; answer=None
+
+async def _llm_plan_and_reply(user_text: str, call_state: dict) -> tuple:
+    """استخدام GPT لفهم النية والرد مع استدعاء الأدوات"""
+    intent = None
+    tool_called = None
+    tool_result = None
+    answer = None
+    
     if not openai_client:
         return intent, tool_called, tool_result, "عذرًا، الخدمة غير متاحة مؤقتًا."
-
-    SYSTEM = (
-        "أنت مساعد اتصال لشركة اتصالات سعودية. استنتج النية بإيجاز، واختر أداة واحدة إن لزم، ثم اكتب جواباً موجزاً مهذباً بالعربية الفصحى."
-    )
-
+    
+    # تحضير السياق
+    from_number = call_state.get("from_number", "")
+    turn = call_state.get("turn", 0)
+    
+    SYSTEM = """أنت مساعد اتصال لشركة اتصالات سعودية رائدة. 
+    - استنتج نية العميل بدقة
+    - استخدم الأدوات المناسبة للاستعلام عن البيانات
+    - قدم إجابات موجزة ومهذبة بالعربية الفصحى
+    - كن ودودًا ومحترفًا في نفس الوقت
+    - إذا لم تفهم الطلب، اطلب التوضيح بلطف"""
+    
+    # تعريف الأدوات المتاحة
     tools = [
         {
             "type": "function",
             "function": {
                 "name": "lookup_balance",
-                "description": "جلب رصيد العميل الحالي باستخدام رقم هاتفه أو رقم حسابه.",
-                "parameters": {"type": "object", "properties": {"customer_id": {"type": "string"}}, "required": ["customer_id"]},
-            },
+                "description": "جلب رصيد العميل الحالي ومعلومات الباقة",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "phone_number": {"type": "string", "description": "رقم هاتف العميل"}
+                    },
+                    "required": ["phone_number"]
+                }
+            }
         },
         {
             "type": "function",
             "function": {
                 "name": "open_ticket",
-                "description": "فتح تذكرة دعم فني مع وصف موجز للمشكلة.",
-                "parameters": {"type": "object", "properties": {"summary": {"type": "string"}}, "required": ["summary"]},
-            },
+                "description": "فتح تذكرة دعم فني للعميل",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "summary": {"type": "string", "description": "وصف المشكلة"},
+                        "priority": {"type": "string", "enum": ["low", "normal", "high", "urgent"]}
+                    },
+                    "required": ["summary"]
+                }
+            }
         },
+        {
+            "type": "function",
+            "function": {
+                "name": "check_package_info",
+                "description": "الاستعلام عن تفاصيل الباقة الحالية للعميل",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "phone_number": {"type": "string"}
+                    },
+                    "required": ["phone_number"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "transfer_to_agent",
+                "description": "تحويل المكالمة إلى موظف خدمة عملاء",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "department": {"type": "string", "enum": ["sales", "technical", "billing", "general"]},
+                        "reason": {"type": "string"}
+                    },
+                    "required": ["department", "reason"]
+                }
+            }
+        }
     ]
-
+    
     try:
+        # إضافة رقم المتصل للسياق
+        user_message = f"المتصل من الرقم: {from_number}\nالرسالة: {user_text}"
+        
         comp = openai_client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role": "system", "content": SYSTEM}, {"role": "user", "content": user_text}],
+            messages=[
+                {"role": "system", "content": SYSTEM},
+                {"role": "user", "content": user_message}
+            ],
             tools=tools,
             tool_choice="auto",
-            temperature=0.2,
-            max_tokens=180,
+            temperature=0.3,
+            max_tokens=200,
         )
+        
         choice = comp.choices[0]
         msg = choice.message
+        
+        # معالجة استدعاء الأدوات
         if choice.finish_reason == "tool_calls" and msg.tool_calls:
-            call: ChatCompletionMessageToolCall = msg.tool_calls[0]
+            call = msg.tool_calls[0]
             tool_called = call.function.name
             args = json.loads(call.function.arguments or "{}")
+            
             if tool_called == "lookup_balance":
-                tr = _mock_lookup_balance(args.get("customer_id", ""))
-                tool_result = json.dumps(tr, ensure_ascii=False)
+                phone = args.get("phone_number", from_number)
+                result = await _lookup_customer_balance(phone)
+                tool_result = json.dumps(result, ensure_ascii=False)
                 intent = "balance_inquiry"
-                answer = f"رصيدك الحالي هو {tr.get('balance', 'غير متاح')} ريال."
+                
+                if result.get("success"):
+                    balance = result.get("balance", 0)
+                    package = result.get("package", "غير محدد")
+                    answer = f"رصيدك الحالي هو {balance} ريال سعودي. وأنت مشترك في {package}."
+                else:
+                    answer = "عذرًا، لم أتمكن من العثور على معلومات حسابك. هل يمكنك التأكد من رقم الهاتف؟"
+                    
             elif tool_called == "open_ticket":
-                tid = _mock_open_ticket(args.get("summary", ""))
-                tool_result = tid
+                ticket_id = await _create_support_ticket(
+                    from_number, 
+                    args.get("summary", ""),
+                    args.get("priority", "normal")
+                )
+                tool_result = ticket_id
                 intent = "open_ticket"
-                answer = f"تم فتح تذكرة رقم {tid}. سنوافيك بالتحديثات."
+                answer = f"تم فتح تذكرة الدعم رقم {ticket_id}. سيتواصل معك فريق الدعم الفني خلال 24 ساعة."
+                
+            elif tool_called == "check_package_info":
+                phone = args.get("phone_number", from_number)
+                info = await _get_package_info(phone)
+                tool_result = json.dumps(info, ensure_ascii=False)
+                intent = "package_inquiry"
+                
+                if info.get("success"):
+                    answer = f"أنت مشترك في {info.get('package_name')}. {info.get('description', '')}"
+                else:
+                    answer = "عذرًا، لم أتمكن من الحصول على معلومات الباقة."
+                    
+            elif tool_called == "transfer_to_agent":
+                dept = args.get("department", "general")
+                reason = args.get("reason", "")
+                intent = "transfer_request"
+                answer = f"سأقوم بتحويلك إلى قسم {_get_dept_name(dept)}. من فضلك انتظر قليلاً."
+                
+        # إذا لم يتم استدعاء أي أداة
         if not answer:
-            intent = intent or "general_support"
-            answer = (msg.content or "").strip() or "حاضر. كيف أستطيع مساعدتك؟"
+            intent = intent or "general_inquiry"
+            answer = (msg.content or "").strip()
+            if not answer:
+                answer = "كيف يمكنني مساعدتك اليوم؟"
+                
     except Exception as e:
-        logger.error("LLM error: %s", e)
-        answer = "عذراً، لم أفهم جيداً. هل يمكنك التوضيح؟"
-
+        logger.error(f"LLM error: {e}")
+        answer = "عذرًا، حدث خطأ. هل يمكنك إعادة المحاولة؟"
+    
     return intent, tool_called, tool_result, answer
 
-# أدوات وهمية
+def _get_dept_name(dept: str) -> str:
+    """ترجمة أسماء الأقسام"""
+    departments = {
+        "sales": "المبيعات",
+        "technical": "الدعم الفني",
+        "billing": "الفواتير والحسابات",
+        "general": "خدمة العملاء"
+    }
+    return departments.get(dept, "خدمة العملاء")
 
-def _mock_lookup_balance(customer_id: str):
-    return {"customer_id": customer_id or "12345", "balance": 150.50}
+async def _lookup_customer_balance(phone: str) -> dict:
+    """البحث عن رصيد العميل من قاعدة البيانات"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        
+        # تنظيف رقم الهاتف
+        clean_phone = re.sub(r'\D', '', phone)
+        if not clean_phone.startswith("966"):
+            clean_phone = "966" + clean_phone
+            
+        cur.execute("""
+            SELECT customer_id, name, account_balance, current_package 
+            FROM customers 
+            WHERE phone = ? OR phone = ?
+        """, (phone, clean_phone))
+        
+        row = cur.fetchone()
+        conn.close()
+        
+        if row:
+            return {
+                "success": True,
+                "customer_id": row[0],
+                "name": row[1],
+                "balance": row[2],
+                "package": row[3]
+            }
+        else:
+            return {"success": False, "message": "Customer not found"}
+            
+    except Exception as e:
+        logger.error(f"Database error: {e}")
+        return {"success": False, "message": "Database error"}
 
+async def _get_package_info(phone: str) -> dict:
+    """الحصول على معلومات الباقة"""
+    customer = await _lookup_customer_balance(phone)
+    if customer.get("success"):
+        package_name = customer.get("package", "")
+        
+        # معلومات الباقات (يمكن نقلها لقاعدة البيانات)
+        packages = {
+            "باقة البلاتينيوم": {
+                "description": "باقة غير محدودة للإنترنت والمكالمات المحلية، مع 1000 دقيقة دولية",
+                "price": 399,
+                "data": "غير محدود",
+                "minutes": "غير محدود محلي + 1000 دولي"
+            },
+            "باقة الذهبية": {
+                "description": "200 جيجا إنترنت، 500 دقيقة محلية، 100 دقيقة دولية",
+                "price": 199,
+                "data": "200 GB",
+                "minutes": "500 محلي + 100 دولي"
+            },
+            "باقة الفضية": {
+                "description": "50 جيجا إنترنت، 200 دقيقة محلية",
+                "price": 99,
+                "data": "50 GB",
+                "minutes": "200 محلي"
+            }
+        }
+        
+        info = packages.get(package_name, {})
+        return {
+            "success": True,
+            "package_name": package_name,
+            "description": info.get("description", ""),
+            "price": info.get("price", 0),
+            "data": info.get("data", ""),
+            "minutes": info.get("minutes", "")
+        }
+    
+    return {"success": False}
 
-def _mock_open_ticket(summary: str):
-    return f"T-{str(uuid.uuid4())[:8]}"
+async def _create_support_ticket(phone: str, summary: str, priority: str = "normal") -> str:
+    """إنشاء تذكرة دعم جديدة"""
+    try:
+        ticket_id = f"T-{str(uuid.uuid4())[:8].upper()}"
+        
+        # البحث عن معرف العميل
+        customer = await _lookup_customer_balance(phone)
+        customer_id = customer.get("customer_id", phone) if customer.get("success") else phone
+        
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO tickets (ticket_id, customer_id, summary, priority, status)
+            VALUES (?, ?, ?, ?, 'open')
+        """, (ticket_id, customer_id, summary, priority))
+        conn.commit()
+        conn.close()
+        
+        logger.info(f"✅ Created ticket {ticket_id} for customer {customer_id}")
+        return ticket_id
+        
+    except Exception as e:
+        logger.error(f"Failed to create ticket: {e}")
+        return f"T-{str(uuid.uuid4())[:8].upper()}"
 
-# تشكيل عربي بسيط عبر GPT (اختياري)
 async def _arabic_diacritize_and_style(text: str) -> str:
+    """إضافة التشكيل العربي وعلامات الإلقاء"""
     if not openai_client:
         return text
-    prompt = f"""أضف التشكيل العربي للنص التالي بدقة وتهذيب، وأدرج إشارات توقف مناسبة مثل [pause=300ms] دون مبالغة.
+        
+    prompt = f"""أضف التشكيل العربي للنص التالي بدقة، مع الحفاظ على الوضوح.
+أضف علامات توقف [pause=300ms] في الأماكن المناسبة فقط (بين الجمل الطويلة).
+لا تغير المعنى أو تضيف كلمات جديدة.
+
 النص: {text}
-"""
+
+النص المُشكَّل:"""
+    
     try:
         comp = openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
-            max_tokens=250,
+            max_tokens=300,
         )
-        return (comp.choices[0].message.content or text).strip()
-    except Exception:
+        styled = (comp.choices[0].message.content or text).strip()
+        
+        # إزالة علامات التوقف من النص للـ TTS (OpenAI TTS لا يدعمها)
+        styled_clean = re.sub(r'\[pause=\d+ms\]', '', styled)
+        return styled_clean
+        
+    except Exception as e:
+        logger.error(f"Diacritization error: {e}")
         return text
 
-# TTS عبر OpenAI (صيغة MP3) + fallback
 async def _synthesize_tts(text: str) -> Optional[str]:
+    """توليد الصوت باستخدام OpenAI TTS"""
     if not openai_client:
         return None
-    file_id = f"{uuid.uuid4()}.mp3"
-    out_path = os.path.join("public", "tts", file_id)
-    url = f"{BASE_URL}/public/tts/{file_id}"
+        
     try:
-        with openai_client.audio.speech.with_streaming_response.create(
-            model="gpt-4o-mini-tts",
-            voice="alloy",
+        file_id = f"{uuid.uuid4()}.mp3"
+        out_path = os.path.join("public", "tts", file_id)
+        url = f"{BASE_URL}/public/tts/{file_id}"
+        
+        # استخدام صوت عربي مناسب
+        response = openai_client.audio.speech.create(
+            model="tts-1",  # أو "tts-1-hd" لجودة أعلى
+            voice="alloy",  # يمكن تجربة: nova, shimmer, echo, fable, onyx
             input=text,
-            response_format="mp3",
-        ) as resp:
-            resp.stream_to_file(out_path)
-        logger.info("TTS OK -> %s", url)
+            response_format="mp3"
+        )
+        
+        # حفظ الملف الصوتي
+        response.stream_to_file(out_path)
+        logger.info(f"✅ TTS generated: {url}")
         return url
-    except TypeError:
-        # نسخ مكتبة لا تدعم response_format
-        with openai_client.audio.speech.with_streaming_response.create(
-            model="gpt-4o-mini-tts",
-            voice="alloy",
-            input=text,
-        ) as resp:
-            resp.stream_to_file(out_path)
-        logger.info("TTS OK (fallback) -> %s", url)
-        return url
+        
     except Exception as e:
-        logger.error("TTS error: %s", e)
+        logger.error(f"TTS error: {e}")
         return None
 
 # ----------------------------------------------------------------------------
-# معالجة دورة حوار واحدة
+# معالجة دورة المحادثة
 # ----------------------------------------------------------------------------
+
 async def _handle_user_turn(call_sid: str, user_text: str):
+    """معالجة دورة واحدة من المحادثة"""
     if not call_sid:
-        logger.warning("No call_sid while handling turn. Ignoring.")
+        logger.warning("No call_sid while handling turn")
         return
-
-    intent, tool_called, tool_result, reply_text = await _llm_plan_and_reply(user_text)
+    
+    start_time = datetime.datetime.utcnow()
+    
+    # الحصول على حالة المكالمة
+    call_state = CALL_STATE.get(call_sid, {})
+    
+    # معالجة بـ LLM
+    intent, tool_called, tool_result, reply_text = await _llm_plan_and_reply(user_text, call_state)
+    
+    # تحسين النص العربي
     prepared_text = await _arabic_diacritize_and_style(reply_text)
+    
+    # توليد الصوت
     mp3_url = await _synthesize_tts(prepared_text)
-
-    if twilio_client:
+    
+    # تحديث المكالمة عبر Twilio
+    if twilio_client and call_sid:
         try:
             if mp3_url:
-                twiml = f"""
+                # استخدام ملف الصوت المولّد
+                twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Play>{mp3_url}</Play>
-  <Redirect method="POST">/voice</Redirect>
-</Response>
-""".strip()
+  <Redirect method="POST">{BASE_URL}/voice</Redirect>
+</Response>"""
             else:
-                safe_text = prepared_text or reply_text or "حسنًا، هل يمكنك التوضيح أكثر؟"
-                twiml = f"""
+                # استخدام TTS المدمج في Twilio كخيار احتياطي
+                safe_text = prepared_text or reply_text or "هل يمكنك التوضيح أكثر؟"
+                twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say language="ar-SA" voice="Polly.Zeina">{safe_text}</Say>
-  <Redirect method="POST">/voice</Redirect>
-</Response>
-""".strip()
+  <Redirect method="POST">{BASE_URL}/voice</Redirect>
+</Response>"""
+            
+            # تحديث المكالمة
             twilio_client.calls(call_sid).update(twiml=twiml)
-            logger.info("CALL UPDATE [%s]: played mp3=%s", call_sid, bool(mp3_url))
+            logger.info(f"✅ Call updated [{call_sid}]: TTS={bool(mp3_url)}")
+            
         except TwilioException as e:
-            logger.error("Twilio update error [%s]: %s", call_sid, e)
-
-    state = CALL_STATE.get(call_sid, {"turn": 0})
-    state["turn"] = state.get("turn", 0) + 1
-    CALL_STATE[call_sid] = state
-    log_conv(call_sid, state["turn"], user_text, intent, tool_called, tool_result, reply_text, mp3_url or "")
+            logger.error(f"Twilio update error [{call_sid}]: {e}")
+    
+    # تحديث حالة المكالمة
+    call_state["turn"] = call_state.get("turn", 0) + 1
+    CALL_STATE[call_sid] = call_state
+    
+    # حساب المدة
+    duration_ms = int((datetime.datetime.utcnow() - start_time).total_seconds() * 1000)
+    
+    # تسجيل المحادثة
+    log_conversation(
+        call_sid,
+        call_state["turn"],
+        user_text,
+        intent,
+        tool_called,
+        tool_result,
+        reply_text,
+        mp3_url or "",
+        duration_ms
+    )
 
 # ----------------------------------------------------------------------------
-# Webhook حالة Twilio (اختياري لكن مفيد)
+# نقاط نهاية إضافية
 # ----------------------------------------------------------------------------
+
 @app.post("/twilio/status")
-async def twilio_status(request: Request):
+async def twilio_status_callback(request: Request):
+    """معالج حالة المكالمة من Twilio"""
     try:
         form = await request.form()
-        logger.info("Twilio status: %s -> %s", form.get("CallSid", ""), form.get("CallStatus", ""))
-    except Exception:
-        pass
+        call_sid = form.get("CallSid", "")
+        call_status = form.get("CallStatus", "")
+        
+        logger.info(f"📞 Call status: {call_sid} -> {call_status}")
+        
+        # تنظيف الحالة عند انتهاء المكالمة
+        if call_status in ["completed", "failed", "busy", "no-answer"]:
+            if call_sid in CALL_STATE:
+                del CALL_STATE[call_sid]
+                logger.info(f"🧹 Cleaned up state for call {call_sid}")
+                
+    except Exception as e:
+        logger.error(f"Status callback error: {e}")
+        
     return PlainTextResponse("")
 
-# ----------------------------------------------------------------------------
-# Healthcheck
-# ----------------------------------------------------------------------------
 @app.get("/health")
-async def health():
-    return PlainTextResponse("OK")
+async def health_check():
+    """فحص صحة التطبيق"""
+    checks = {
+        "status": "healthy",
+        "timestamp": datetime.datetime.utcnow().isoformat(),
+        "services": {
+            "database": False,
+            "openai": bool(openai_client),
+            "twilio": bool(twilio_client),
+            "google_stt": GOOGLE_STT_AVAILABLE
+        }
+    }
+    
+    # فحص قاعدة البيانات
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM conversations")
+        count = cur.fetchone()[0]
+        conn.close()
+        checks["services"]["database"] = True
+        checks["conversations_count"] = count
+    except Exception:
+        pass
+    
+    # تحديد الحالة العامة
+    all_healthy = all(checks["services"].values())
+    status_code = 200 if all_healthy else 503
+    
+    return JSONResponse(content=checks, status_code=status_code)
+
+@app.get("/")
+async def root():
+    """الصفحة الرئيسية"""
+    return JSONResponse({
+        "name": "Smart Call Center API",
+        "version": "1.0.0",
+        "status": "running",
+        "endpoints": {
+            "voice": "/voice",
+            "media": "/media",
+            "health": "/health",
+            "stats": "/api/stats",
+            "conversations": "/api/conversations"
+        }
+    })
 
 # ----------------------------------------------------------------------------
-# تشغيل محلي
+# واجهات API للإدارة
 # ----------------------------------------------------------------------------
+
+@app.get("/api/stats")
+async def get_statistics():
+    """إحصائيات عامة عن النظام"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        
+        # إحصائيات المحادثات
+        cur.execute("SELECT COUNT(*) FROM conversations")
+        total_conversations = cur.fetchone()[0]
+        
+        cur.execute("SELECT COUNT(DISTINCT call_sid) FROM conversations")
+        total_calls = cur.fetchone()[0]
+        
+        # إحصائيات التذاكر
+        cur.execute("SELECT COUNT(*) FROM tickets")
+        total_tickets = cur.fetchone()[0]
+        
+        cur.execute("SELECT COUNT(*) FROM tickets WHERE status='open'")
+        open_tickets = cur.fetchone()[0]
+        
+        # إحصائيات العملاء
+        cur.execute("SELECT COUNT(*) FROM customers")
+        total_customers = cur.fetchone()[0]
+        
+        # الأدوات الأكثر استخدامًا
+        cur.execute("""
+            SELECT tool_called, COUNT(*) as count 
+            FROM conversations 
+            WHERE tool_called != '' 
+            GROUP BY tool_called 
+            ORDER BY count DESC 
+            LIMIT 5
+        """)
+        top_tools = [{"tool": row[0], "count": row[1]} for row in cur.fetchall()]
+        
+        # النوايا الأكثر شيوعًا
+        cur.execute("""
+            SELECT intent, COUNT(*) as count 
+            FROM conversations 
+            WHERE intent != '' 
+            GROUP BY intent 
+            ORDER BY count DESC 
+            LIMIT 5
+        """)
+        top_intents = [{"intent": row[0], "count": row[1]} for row in cur.fetchall()]
+        
+        conn.close()
+        
+        return JSONResponse({
+            "conversations": {
+                "total": total_conversations,
+                "unique_calls": total_calls,
+                "active_calls": len(CALL_STATE)
+            },
+            "tickets": {
+                "total": total_tickets,
+                "open": open_tickets,
+                "closed": total_tickets - open_tickets
+            },
+            "customers": {
+                "total": total_customers
+            },
+            "top_tools": top_tools,
+            "top_intents": top_intents,
+            "timestamp": datetime.datetime.utcnow().isoformat()
+        })
+        
+    except Exception as e:
+        logger.error(f"Stats error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/conversations")
+async def get_conversations(limit: int = 50, offset: int = 0):
+    """الحصول على سجل المحادثات"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        
+        cur.execute("""
+            SELECT id, timestamp, call_sid, turn, user_text, intent, 
+                   tool_called, tool_result, reply_text, duration_ms
+            FROM conversations 
+            ORDER BY id DESC 
+            LIMIT ? OFFSET ?
+        """, (limit, offset))
+        
+        conversations = []
+        for row in cur.fetchall():
+            conversations.append({
+                "id": row[0],
+                "timestamp": row[1],
+                "call_sid": row[2],
+                "turn": row[3],
+                "user_text": row[4],
+                "intent": row[5],
+                "tool_called": row[6],
+                "tool_result": row[7],
+                "reply_text": row[8],
+                "duration_ms": row[9]
+            })
+        
+        conn.close()
+        
+        return JSONResponse({
+            "conversations": conversations,
+            "limit": limit,
+            "offset": offset,
+            "total": len(conversations)
+        })
+        
+    except Exception as e:
+        logger.error(f"Conversations API error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/conversations/{call_sid}")
+async def get_call_conversation(call_sid: str):
+    """الحصول على محادثة كاملة لمكالمة معينة"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        
+        cur.execute("""
+            SELECT id, timestamp, turn, user_text, intent, 
+                   tool_called, tool_result, reply_text, duration_ms
+            FROM conversations 
+            WHERE call_sid = ?
+            ORDER BY turn
+        """, (call_sid,))
+        
+        turns = []
+        for row in cur.fetchall():
+            turns.append({
+                "id": row[0],
+                "timestamp": row[1],
+                "turn": row[2],
+                "user_text": row[3],
+                "intent": row[4],
+                "tool_called": row[5],
+                "tool_result": row[6],
+                "reply_text": row[7],
+                "duration_ms": row[8]
+            })
+        
+        conn.close()
+        
+        if not turns:
+            raise HTTPException(status_code=404, detail="Call not found")
+        
+        return JSONResponse({
+            "call_sid": call_sid,
+            "turns": turns,
+            "total_turns": len(turns)
+        })
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Call conversation error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ----------------------------------------------------------------------------
+# تشغيل التطبيق
+# ----------------------------------------------------------------------------
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    
+    logger.info("=" * 50)
+    logger.info("🚀 Starting Smart Call Center")
+    logger.info(f"📍 Port: {PORT}")
+    logger.info(f"🌐 Base URL: {BASE_URL}")
+    logger.info(f"✅ OpenAI: {'Connected' if openai_client else '❌ Not configured'}")
+    logger.info(f"✅ Twilio: {'Connected' if twilio_client else '❌ Not configured'}")
+    logger.info(f"✅ Google STT: {'Available' if GOOGLE_STT_AVAILABLE else '❌ Not available'}")
+    logger.info("=" * 50)
+    
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=PORT,
+        log_level="info",
+        access_log=True
+    )
