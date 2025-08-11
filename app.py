@@ -346,10 +346,27 @@ async def media_stream(ws: WebSocket):
                     encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
                     sample_rate_hertz=8000,
                     language_code="ar-SA",
-                    alternative_language_codes=["en-US"],
+                    # تم إزالة alternative_language_codes لأنه غير مدعوم
+                    # alternative_language_codes=["en-US"],
                     use_enhanced=True,
                     model="phone_call",
                     enable_automatic_punctuation=True,
+                    enable_word_time_offsets=False,
+                    profanity_filter=False,
+                    speech_contexts=[
+                        speech.SpeechContext(
+                            phrases=[
+                                "السلام عليكم",
+                                "رصيدي",
+                                "الباقة",
+                                "فاتورة",
+                                "مشكلة",
+                                "إنترنت",
+                                "شكرا",
+                                "مع السلامة"
+                            ]
+                        )
+                    ]
                 ),
                 interim_results=True,
                 single_utterance=False,
@@ -415,8 +432,13 @@ async def media_stream(ws: WebSocket):
                         ulaw = base64.b64decode(b64)
                         pcm = audioop.ulaw2lin(ulaw, 2)  # تحويل إلى 16-bit PCM
                         req_iter.push(pcm)
+                        # سجل للتأكد من استقبال البيانات
+                        if len(pcm) > 0:
+                            logger.debug(f"Audio chunk received: {len(pcm)} bytes")
                     except Exception as e:
                         logger.warning(f"Error processing audio: {e}")
+                elif b64 and not req_iter:
+                    logger.warning("Audio received but STT not initialized")
                         
             elif etype == "stop":
                 logger.info(f"⏹️ Stream stopped: call_sid={call_sid}")
@@ -468,13 +490,27 @@ async def _consume_stt_responses(stt_responses, get_call_sid):
     try:
         async for resp in _aiter(stt_responses):
             for result in resp.results:
-                transcript = result.alternatives[0].transcript.strip()
-                if result.is_final and transcript:
-                    call_sid = get_call_sid()
-                    logger.info(f"🎤 STT Final [{call_sid}]: {transcript}")
-                    await _handle_user_turn(call_sid, transcript)
+                # عرض النتائج المؤقتة للتشخيص
+                if not result.is_final:
+                    interim_text = result.alternatives[0].transcript.strip()
+                    if interim_text:
+                        logger.debug(f"🎤 STT Interim: {interim_text}")
+                else:
+                    # النتيجة النهائية
+                    transcript = result.alternatives[0].transcript.strip()
+                    if transcript:
+                        call_sid = get_call_sid()
+                        logger.info(f"🎤 STT Final [{call_sid}]: {transcript}")
+                        await _handle_user_turn(call_sid, transcript)
+                    else:
+                        logger.debug("Empty final transcript received")
     except Exception as e:
         logger.error(f"STT processing error: {e}")
+        # في حالة فشل STT، نستخدم وضع الاختبار
+        call_sid = get_call_sid()
+        if call_sid:
+            logger.warning(f"Falling back to test mode for call {call_sid}")
+            await _simulate_user_input(call_sid, delay=3)
 
 async def _simulate_user_input(call_sid: str, delay: int = 5):
     """محاكاة إدخال المستخدم للاختبار"""
