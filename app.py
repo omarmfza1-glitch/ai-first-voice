@@ -1,4 +1,4 @@
-# app.py — مركز اتصال ذكي متكامل (النسخة النهائية v6 - تصحيح SyntaxError)
+# app.py — مركز اتصال ذكي متكامل (النسخة النهائية v7 - تصحيح استدعاء API)
 # -*- coding: utf-8 -*-
 
 # ============================================================================
@@ -43,7 +43,6 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN else None
 twilio_validator = RequestValidator(TWILIO_AUTH_TOKEN) if TWILIO_AUTH_TOKEN else None
 
-# ---- تصحيح SyntaxError هنا ----
 speech_async_client = None
 speech_types = None
 try:
@@ -53,7 +52,8 @@ try:
         os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.abspath("gcp.json")
     
     from google.cloud.speech_v1p1beta1.services import speech
-    from google.cloud.speech_v1p1beta1 import types as speech_types
+    from google.cloud.speech_v1p1beta1 import types as speech_types_module
+    speech_types = speech_types_module
     speech_async_client = speech.SpeechAsyncClient()
     logger.info("✅ Google Cloud Speech Async Client initialized successfully.")
 except (ImportError, Exception) as e:
@@ -99,7 +99,7 @@ def log_conversation(**kwargs):
     except Exception as e: logger.error(f"Failed to log conversation: {e}")
 
 # ============================================================================
-# 7. نقاط النهاية الرئيسية (تم تصحيحها)
+# 7. نقاط النهاية الرئيسية (تم تصحيحها بالكامل)
 # ============================================================================
 @app.post("/twilio/voice")
 async def voice_handler(request: Request, x_twilio_signature: Optional[str] = Header(None)):
@@ -120,47 +120,58 @@ async def voice_handler(request: Request, x_twilio_signature: Optional[str] = He
 async def media_stream_handler(ws: WebSocket):
     await ws.accept()
     call_sid = None
+    event_queue = asyncio.Queue()
 
-    async def request_generator():
-        nonlocal call_sid
-        while True:
-            try:
+    async def ws_receiver():
+        try:
+            while True:
                 message = await ws.receive_json()
-                event = message.get("event")
-                if event == "start":
-                    start_payload = message.get("start", {})
-                    call_sid = start_payload.get("customParameters", {}).get("callSid")
-                    if not call_sid: logger.error("No callSid in start event"); break
-                    logger.info(f"▶️ Twilio stream started for call: {call_sid}")
-                elif event == "media":
-                    chunk = audioop.ulaw2lin(base64.b64decode(message["media"]["payload"]), 2)
-                    yield speech_types.StreamingRecognizeRequest(audio_content=chunk)
-                elif event == "stop":
-                    logger.info(f"⏹️ Twilio stream stopped for {call_sid}."); break
-            except WebSocketDisconnect:
-                logger.info("WebSocket disconnected during generation."); break
+                await event_queue.put(message)
+                if message.get("event") == "stop": break
+        except WebSocketDisconnect: logger.info("WS receiver disconnected.")
+        finally: await event_queue.put(None)
+
+    async def stt_request_generator():
+        nonlocal call_sid
+        # 1. أول طلب يجب أن يكون الإعدادات
+        yield speech_types.StreamingRecognitionConfig(
+            config=speech_types.RecognitionConfig(encoding=speech_types.RecognitionConfig.AudioEncoding.LINEAR16, sample_rate_hertz=8000, language_code="ar-SA", model="telephony", use_enhanced=True, enable_automatic_punctuation=True),
+            interim_results=False)
+        
+        # 2. الآن، معالجة الأحداث من الطابور
+        while True:
+            message = await event_queue.get()
+            if message is None: break
+            event = message.get("event")
+            if event == "start":
+                start_payload = message.get("start", {}); call_sid = start_payload.get("customParameters", {}).get("callSid")
+                if not call_sid: logger.error("No callSid in start event"); break
+                logger.info(f"▶️ Twilio stream started for call: {call_sid}")
+            elif event == "media":
+                chunk = audioop.ulaw2lin(base64.b64decode(message["media"]["payload"]), 2)
+                yield speech_types.StreamingRecognizeRequest(audio_content=chunk)
+            elif event == "stop":
+                logger.info(f"⏹️ Twilio stream stopped for {call_sid}."); break
         logger.info("Audio generator finished.")
+
+    receiver_task = asyncio.create_task(ws_receiver())
 
     if speech_async_client and speech_types and not TEST_MODE:
         try:
-            streaming_config = speech_types.StreamingRecognitionConfig(
-                config=speech_types.RecognitionConfig(encoding=speech_types.RecognitionConfig.AudioEncoding.LINEAR16, sample_rate_hertz=8000, language_code="ar-SA", model="telephony", use_enhanced=True, enable_automatic_punctuation=True),
-                interim_results=False
-            )
-            responses = await speech_async_client.streaming_recognize(config=streaming_config, requests=request_generator())
-            
-            async for response in responses:
+            # 3. استدعاء الواجهة البرمجية بالطريقة الصحيحة (بدون معامل config)
+            responses = speech_async_client.streaming_recognize(requests=stt_request_generator())
+            async for response in await responses:
                 if not response.results or not response.results[0].alternatives: continue
                 transcript = response.results[0].alternatives[0].transcript.strip()
-                if transcript:
+                if transcript and call_sid:
                     logger.info(f"🎤 STT Final [{call_sid}]: '{transcript}'")
                     asyncio.create_task(_handle_user_turn(call_sid, transcript))
         except Exception as e:
-            logger.error(f"STT streaming error for call {call_sid}: {e}")
+            logger.error(f"STT streaming error: {e}")
     else:
         logger.warning(f"⚠️ STT is unavailable. This call will not be interactive.")
-        async for _ in request_generator(): pass
 
+    await receiver_task
     logger.info(f"WebSocket cleanup for call {call_sid} completed.")
 
 @app.post("/twilio/status")
