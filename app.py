@@ -1,4 +1,4 @@
-# app.py — مركز اتصال ذكي متكامل (النسخة المُصحَّحة)
+# app.py — مركز اتصال ذكي متكامل (النسخة النهائية)
 # -*- coding: utf-8 -*-
 
 # ============================================================================
@@ -79,7 +79,7 @@ if not openai_client: logger.warning("⚠️ OpenAI API key not configured.")
 if not twilio_client: logger.warning("⚠️ Twilio client not initialized.")
 
 # ============================================================================
-# 4. قاعدة البيانات (الكود هنا لم يتغير)
+# 4. قاعدة البيانات
 # ============================================================================
 DB_PATH = os.path.join(os.path.dirname(__file__), "db.sqlite3")
 
@@ -113,7 +113,7 @@ app.mount("/public", StaticFiles(directory="public"), name="public")
 CALL_STATE: Dict[str, Dict[str, Any]] = {}
 
 # ============================================================================
-# 6. الأدوات المساعدة (الكود هنا لم يتغير)
+# 6. الأدوات المساعدة
 # ============================================================================
 def log_conversation(**kwargs):
     try:
@@ -139,24 +139,20 @@ class SpeechRequestIterator:
             yield speech.StreamingRecognizeRequest(audio_content=chunk)
 
 # ============================================================================
-# 7. نقاط النهاية الرئيسية (Core Endpoints) - تم تعديلها
+# 7. نقاط النهاية الرئيسية (Core Endpoints) - تم تصحيحها
 # ============================================================================
 @app.post("/twilio/voice")
 async def voice_handler(request: Request, x_twilio_signature: Optional[str] = Header(None)):
-    # --- التحقق من التوقيع (تم نقله إلى هنا) ---
     if twilio_validator:
         form_params = await request.form()
         url = str(request.url)
-        # Heroku يغير البروتوكول، نحتاج لإصلاحه
         if "x-forwarded-proto" in request.headers:
             url = url.replace("http://", f"{request.headers['x-forwarded-proto']}://")
-            
         if not twilio_validator.validate(url, form_params, x_twilio_signature or ""):
             logger.warning(f"❌ Twilio signature validation failed for /twilio/voice")
             raise HTTPException(status_code=403, detail="Invalid Twilio Signature")
     else:
         form_params = await request.form()
-    # --- نهاية التحقق ---
 
     call_sid = form_params.get("CallSid", f"local_{uuid.uuid4()}")
     from_number = form_params.get("From", "unknown")
@@ -168,83 +164,97 @@ async def voice_handler(request: Request, x_twilio_signature: Optional[str] = He
     else:
         first_turn = False
     
-    ws_url = f"{BASE_URL.replace('http', 'ws')}/twilio/media?callSid={call_sid}"
+    # تحديث: إرسال callSid عبر <Parameter> بدلاً من query string
+    ws_url = f"{BASE_URL.replace('http', 'ws')}/twilio/media"
     
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Start>
-        <Stream url="{ws_url}" />
+        <Stream url="{ws_url}">
+            <Parameter name="callSid" value="{call_sid}"/>
+        </Stream>
     </Start>
     {'<Say language="ar-SA" voice="Polly.Zeina">مرحبًا بكم في مركز الاتصال الذكي. كيف يمكنني مساعدتك اليوم؟</Say>' if first_turn else ''}
     <Pause length="60"/>
 </Response>""".strip()
     
-    logger.info(f"📞 Voice handler: call_sid={call_sid}, first_turn={first_turn}")
+    logger.info(f"📞 Voice handler: Sending TwiML for call_sid={call_sid}")
     return Response(content=twiml, media_type="text/xml; charset=utf-8")
 
 
 @app.websocket("/twilio/media")
 async def media_stream_handler(ws: WebSocket):
-    # (هذه الدالة لم تتغير)
     await ws.accept()
-    call_sid = ws.query_params.get("callSid", "")
-    if not call_sid:
-        logger.error("WebSocket connected without callSid. Closing.")
-        await ws.close(code=1008); return
-
-    logger.info(f"🔌 WebSocket connected for call: {call_sid}")
-    req_iter, stt_task, stt_available = None, None, GOOGLE_STT_AVAILABLE and not TEST_MODE
-    
-    if stt_available:
-        try:
-            speech_client = speech.SpeechClient()
-            streaming_config = speech.StreamingRecognitionConfig(
-                config=speech.RecognitionConfig(encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16, sample_rate_hertz=8000, language_code="ar-SA", model="telephony", use_enhanced=True, enable_automatic_punctuation=True),
-                interim_results=False
-            )
-            req_iter = SpeechRequestIterator()
-            stt_responses = speech_client.streaming_recognize(streaming_config, req_iter)
-            stt_task = asyncio.create_task(_consume_stt_responses(stt_responses, call_sid))
-            logger.info("✅ Google STT stream initialized.")
-        except Exception as e:
-            logger.error(f"Failed to initialize STT for {call_sid}: {e}"); stt_available = False
-            
-    if not stt_available:
-         logger.warning(f"⚠️ STT is unavailable. Falling back to TEST MODE for call {call_sid}")
-         asyncio.create_task(_simulate_user_input(call_sid, delay=5))
+    call_sid = None  # سيتم استخلاصه من رسالة 'start'
+    req_iter, stt_task = None, None
 
     try:
         while True:
             message = await ws.receive_json()
             event = message.get("event")
-            if event == "start": logger.info(f"▶️ Twilio stream started for {call_sid}.")
+
+            if event == "start":
+                # تحديث: استخلاص callSid من رسالة البدء
+                start_payload = message.get("start", {})
+                call_sid = start_payload.get("customParameters", {}).get("callSid")
+                if not call_sid:
+                    logger.error("'start' event received without callSid in customParameters. Closing.")
+                    break
+                
+                logger.info(f"▶️ Twilio stream started for call: {call_sid}")
+                
+                # الآن فقط نبدأ STT بعد الحصول على callSid
+                stt_available = GOOGLE_STT_AVAILABLE and not TEST_MODE
+                if stt_available:
+                    try:
+                        speech_client = speech.SpeechClient()
+                        streaming_config = speech.StreamingRecognitionConfig(
+                            config=speech.RecognitionConfig(encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16, sample_rate_hertz=8000, language_code="ar-SA", model="telephony", use_enhanced=True, enable_automatic_punctuation=True),
+                            interim_results=False
+                        )
+                        req_iter = SpeechRequestIterator()
+                        stt_responses = speech_client.streaming_recognize(streaming_config, req_iter)
+                        stt_task = asyncio.create_task(_consume_stt_responses(stt_responses, call_sid))
+                        logger.info(f"✅ Google STT stream initialized for {call_sid}.")
+                    except Exception as e:
+                        logger.error(f"Failed to initialize STT for {call_sid}: {e}")
+                        stt_available = False
+                
+                if not stt_available:
+                    logger.warning(f"⚠️ STT is unavailable. Falling back to TEST MODE for call {call_sid}")
+                    asyncio.create_task(_simulate_user_input(call_sid, delay=5))
+
             elif event == "media":
-                if req_iter: req_iter.push(audioop.ulaw2lin(base64.b64decode(message["media"]["payload"]), 2))
-            elif event == "stop": logger.info(f"⏹️ Twilio stream stopped for {call_sid}."); break
-    except WebSocketDisconnect: logger.info(f"🔌 WebSocket disconnected for call {call_sid}.")
-    except Exception as e: logger.exception(f"WebSocket error for {call_sid}: {e}")
+                if req_iter:
+                    req_iter.push(audioop.ulaw2lin(base64.b64decode(message["media"]["payload"]), 2))
+            
+            elif event == "stop":
+                logger.info(f"⏹️ Twilio stream stopped for {call_sid}.")
+                break
+    except WebSocketDisconnect:
+        logger.info(f"🔌 WebSocket disconnected for call {call_sid}.")
+    except Exception as e:
+        logger.exception(f"WebSocket error for {call_sid}: {e}")
     finally:
         if req_iter: req_iter.close()
         if stt_task: await asyncio.gather(stt_task, return_exceptions=True)
+        if ws.client_state != "DISCONNECTED": await ws.close()
         logger.info(f"WebSocket cleanup completed for {call_sid}")
 
 
 @app.post("/twilio/status")
 async def status_callback_handler(request: Request, x_twilio_signature: Optional[str] = Header(None)):
-    # --- التحقق من التوقيع (تم نقله إلى هنا) ---
     if twilio_validator:
         form_params = await request.form()
         url = str(request.url)
         if "x-forwarded-proto" in request.headers:
             url = url.replace("http://", f"{request.headers['x-forwarded-proto']}://")
-
         if not twilio_validator.validate(url, form_params, x_twilio_signature or ""):
             logger.warning(f"❌ Twilio signature validation failed for /twilio/status")
             raise HTTPException(status_code=403, detail="Invalid Twilio Signature")
     else:
         form_params = await request.form()
-    # --- نهاية التحقق ---
-
+    
     call_sid = form_params.get("CallSid")
     call_status = form_params.get("CallStatus")
     logger.info(f"📞 Call Status: {call_sid} -> {call_status}")
@@ -256,14 +266,8 @@ async def status_callback_handler(request: Request, x_twilio_signature: Optional
             
     return PlainTextResponse("")
 
-# ... باقي الكود من القسم 8 إلى 12 يبقى كما هو تمامًا ...
-# (Please append the rest of the code from sections 8-12 of the previous version, as it remains unchanged)
-# The functions _consume_stt_responses, _handle_user_turn, _llm_plan_and_reply,
-# _synthesize_tts, the AI tools, test mode, and admin endpoints are all still correct.
-
-# (For completeness, here is the rest of the code again)
 # ============================================================================
-# 8. منطق المحادثة والذكاء الاصطناعي (Conversation & AI Logic)
+# 8. منطق المحادثة والذكاء الاصطناعي
 # ============================================================================
 async def _consume_stt_responses(stt_responses, call_sid: str):
     try:
@@ -370,7 +374,7 @@ async def _simulate_user_input(call_sid: str, delay: int = 5):
         await asyncio.sleep(15)
 
 # ============================================================================
-# 11. نقاط نهاية إضافية للإدارة (Admin & Health Endpoints)
+# 11. نقاط نهاية إضافية للإدارة
 # ============================================================================
 @app.get("/")
 async def root(): return {"message": "Smart Call Center API is running."}
@@ -380,7 +384,7 @@ async def health_check():
     return {"status": "healthy", "services": {"database": "ok" if os.path.exists(DB_PATH) else "error", "openai": "ok" if openai_client else "disabled", "twilio": "ok" if twilio_client else "disabled", "google_stt": "ok" if GOOGLE_STT_AVAILABLE else "disabled"}}
 
 # ============================================================================
-# 12. تشغيل التطبيق (Run Application)
+# 12. تشغيل التطبيق
 # ============================================================================
 if __name__ == "__main__":
     import uvicorn
